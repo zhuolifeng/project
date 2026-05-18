@@ -126,7 +126,7 @@ class LLMRunner:
                 env=self.env,
                 parser=self.parser,
                 feedback_manager=self.feedback_manager,
-                max_tokens=1024,
+                max_tokens=65536,
                 debug_mode=self.debug_mode,
                 use_waypoints=(self.llm_output_mode == "action_and_path"),
                 use_history=self.use_history,
@@ -141,7 +141,7 @@ class LLMRunner:
                 env=self.env,
                 parser=self.parser,
                 feedback_manager=self.feedback_manager,
-                max_tokens=512,
+                max_tokens=65536,
                 debug_mode=self.debug_mode,
                 robot_name_map=self.env.robot_name_map,
                 max_calls_per_round=10,
@@ -309,7 +309,7 @@ class LLMRunner:
                 pickle.dump(sim_data, f)
 
             self.prompter.post_execute_update(
-                obs_desp="", # TODO
+                obs_desp=obs,
                 execute_success=(not rewind_env),
                 parsed_plan=current_llm_plan[0].get_action_desp()
             )

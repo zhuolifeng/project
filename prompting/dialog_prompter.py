@@ -5,6 +5,7 @@ import pickle
 import openai
 import requests
 import numpy as np
+import re
 from datetime import datetime
 from os.path import join
 from typing import List, Tuple, Dict, Union, Optional, Any
@@ -33,6 +34,8 @@ Each <coord> is a tuple (x,y,z) for gripper location, follow these steps to plan
     If a plan failed to execute, re-plan to choose more feasible steps in each PATH, or choose different actions.
 """
 
+SWEEP_TASK_PROMPT = """Alice（dustpan）和 Bob（broom）需协作清扫桌面上的所有方块。清扫规则：Alice 需将 dustpan 置于方块一侧，Bob 从对侧将方块 sweep 进簸箕。每轮任务需根据 “Scene description” 和 “Environment feedback” 迭代优化计划。每个机器人每轮严格只执行一个动作，因此只需要输出一组动作。请检查“History”中的内容，机器人当前位于上一次 MOVE 到的物体边缘，只有当两者处于同一物品边缘时才能进行 SWEEP 操作。只需要在最后进行一次 DUMP。"""
+
 class DialogPrompter:
     """
     Each round contains multiple prompts, query LLM once per each agent 
@@ -42,7 +45,7 @@ class DialogPrompter:
         env: MujocoSimEnv,
         parser: LLMResponseParser,
         feedback_manager: FeedbackManager, 
-        max_tokens: int = 512, 
+        max_tokens: int = 65536, 
         debug_mode: bool = False,
         use_waypoints: bool = False,
         robot_name_map: Dict[str, str] = {"panda": "Bob"},
@@ -65,11 +68,13 @@ class DialogPrompter:
         self.feedback_manager = feedback_manager
         self.parser = parser
         self.round_history = []
+        self.round_history_brief = []
         self.failed_plans = [] 
         self.latest_chat_history = []
         self.max_calls_per_round = max_calls_per_round 
         self.temperature = temperature
         self.llm_source = llm_source
+        self.old_obs = None
 
     def compose_system_prompt(
         self, 
@@ -83,8 +88,11 @@ class DialogPrompter:
         if self.use_waypoints:
             action_desp += PATH_PLAN_INSTRUCTION
         agent_prompt = self.env.get_agent_prompt(obs, agent_name)
+        if self.env.__class__.__name__ == "SweepTask":
+            agent_prompt = f"{SWEEP_TASK_PROMPT}\n{agent_prompt}"
+        self.old_obs = obs
         
-        round_history = self.get_round_history() if self.use_history else ""
+        round_history = self.get_round_history_brief() if self.use_history else ""
 
         execute_feedback = ""
         if len(self.failed_plans) > 0:
@@ -109,6 +117,15 @@ class DialogPrompter:
             return ""
         ret = "[History]\n"
         for i, history in enumerate(self.round_history):
+            ret += f"== Round#{i} ==\n{compact_text(history)}\n"
+        ret += f"== Current Round ==\n"
+        return ret
+
+    def get_round_history_brief(self):
+        if len(self.round_history_brief) == 0:
+            return self.get_round_history()
+        ret = "[History]\n"
+        for i, history in enumerate(self.round_history_brief):
             ret += f"== Round#{i} ==\n{compact_text(history)}\n"
         ret += f"== Current Round ==\n"
         return ret
@@ -269,7 +286,7 @@ Your response is:
                     system_prompt=system_prompt,
                     user_prompt=user_prompt,
                     temperature=self.temperature,
-                    max_tokens=self.max_tokens,
+                    max_tokens=65536,
                 )
 
                 print('======= response ======= \n ', response)
@@ -287,6 +304,48 @@ Your response is:
         # breakpoint()
         return response, usage
     
+    def _describe_obs_for_summary(self, obs_desp) -> str:
+        if isinstance(obs_desp, str):
+            return obs_desp
+        try:
+            return self.env.describe_obs(obs_desp)
+        except Exception:
+            return ""
+
+    def _extract_summary(self, summary_response: str) -> str:
+        match = re.search(r"<summary>(.*?)</summary>", summary_response, re.DOTALL)
+        if match:
+            return compact_text(match.group(1).strip())
+        return compact_text(summary_response, max_chars=600)
+
+    def _summarize_round(self, obs_desp, parsed_plan: str) -> str:
+        after_obs = self._describe_obs_for_summary(obs_desp).replace("[Scene description]", "")
+        before_obs = ""
+        if self.old_obs is not None:
+            before_obs = self._describe_obs_for_summary(self.old_obs).replace("[Scene description]", "")
+        chats = "\n".join(compact_items(self.latest_chat_history))
+        summarize_prompt = "<Task Information>"
+        summarize_prompt += f"The task descriptions are as follows:\n<Task Description>{self.env.describe_task_context()}</Task Description>\n\n"
+        for agent in self.robot_agent_names:
+            if self.old_obs is not None:
+                summarize_prompt += f"The prompt for LLM agent {agent} is as follows:\n<Agent Prompt>{self.env.get_agent_prompt(self.old_obs, agent)}</Agent Prompt>\n"
+        summarize_prompt += f"\nThe action descriptions are as follows:\n<Action Description>{self.env.get_action_prompt()}</Action Description>\n\n"
+        summarize_prompt += f"The chats from LLM agents are as follows:\n<LLM chats>{chats}</LLM chats>\n\n"
+        summarize_prompt += f"The parsed action is as follows:\n<parsed_plan>{parsed_plan}</parsed_plan>\n\n"
+        if before_obs:
+            summarize_prompt += f"The environment information before executing the action is as follows:\n<Environment Observation>{before_obs}</Environment Observation>\n\n"
+        if after_obs:
+            summarize_prompt += f"The environment information after executing the action is as follows:\n<Environment Observation>{after_obs}</Environment Observation>\n\n"
+        summarize_prompt += "</Task Information>\nSummarize what each LLM agent did, what action was executed, and what changed in the environment. Your response must contain exactly one concise sentence wrapped in <summary></summary>."
+        response, _ = query_ollama_chat(
+            model=self.llm_source,
+            system_prompt="You summarize multi-agent robot-task execution history for future planning prompts.",
+            user_prompt=summarize_prompt,
+            temperature=0,
+            max_tokens=min(self.max_tokens, 512),
+        )
+        return self._extract_summary(response)
+
     def post_execute_update(self, obs_desp: str, execute_success: bool, parsed_plan: str):
         if execute_success: 
             # clear failed plans, count the previous execute as full past round in history
@@ -295,6 +354,11 @@ Your response is:
             self.round_history.append(
                 f"[Chat History]\n{chats}\n[Executed Action]\n{parsed_plan}"
             )
+            try:
+                self.round_history_brief.append(self._summarize_round(obs_desp, parsed_plan))
+            except Exception as exc:
+                print(f"Summary generation failed, falling back to compact action history: {exc}")
+                self.round_history_brief.append(compact_text(parsed_plan))
         else:
             self.failed_plans.append(
                 compact_text(parsed_plan)
@@ -304,5 +368,6 @@ Your response is:
     def post_episode_update(self):
         # clear for next episode
         self.round_history = []
+        self.round_history_brief = []
         self.failed_plans = [] 
         self.latest_chat_history = []

@@ -1,4 +1,5 @@
 import os
+import re
 from typing import Any, Dict, Optional, Tuple
 
 import requests
@@ -19,6 +20,16 @@ def _parse_ollama_think(value: str) -> Any:
     raise ValueError(
         "OLLAMA_THINK must be one of: true, false, low, medium, high"
     )
+
+
+def strip_think_blocks(text: str) -> str:
+    text = re.sub(r"(?is)<think>.*?</think>\s*", "", text or "")
+    text = re.sub(
+        r"(?is)\bThinking\.\.\..*?\.\.\.done thinking\.\s*",
+        "",
+        text,
+    )
+    return text.strip()
 
 
 def query_ollama_chat(
@@ -55,7 +66,7 @@ def query_ollama_chat(
     response.raise_for_status()
     data = response.json()
     message = data.get("message", {})
-    text = message.get("content", "")
+    text = strip_think_blocks(message.get("content", ""))
     if not text:
         thinking = message.get("thinking", "")
         done_reason = data.get("done_reason", "unknown")
@@ -76,7 +87,7 @@ def query_ollama_chat(
             response.raise_for_status()
             data = response.json()
             message = data.get("message", {})
-            text = message.get("content", "")
+            text = strip_think_blocks(message.get("content", ""))
             if text:
                 return text, data
 
