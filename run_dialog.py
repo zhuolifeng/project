@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 
 from rocobench.envs import SortOneBlockTask, CabinetTask, MoveRopeTask, SweepTask, MakeSandwichTask, PackGroceryTask, MujocoSimEnv, SimRobot, visualize_voxel_scene
 from rocobench import PlannedPathPolicy, LLMPathPlan, MultiArmRRT
-from prompting import LLMResponseParser, FeedbackManager, DialogPrompter, SingleThreadPrompter, save_episode_html
+from prompting import LLMResponseParser, FeedbackManager, DialogPrompter, SingleThreadPrompter, StepPrompter, save_episode_html
 
 # print out logging.info
 logging.basicConfig(level=logging.INFO)
@@ -120,9 +120,10 @@ class LLMRunner:
             step_std_threshold=self.env.waypoint_std_threshold,
             max_failed_waypoints=self.max_failed_waypoints,
         )
-        if llm_comm_mode in ["plan", "chat"]:
+        if llm_comm_mode in ["plan", "chat", "step"]:
             logging.warning(f'Using SingleThreadPrompter for {llm_comm_mode} mode')
-            self.prompter = SingleThreadPrompter(
+            prompter_cls = StepPrompter if llm_comm_mode == "step" else SingleThreadPrompter
+            self.prompter = prompter_cls(
                 env=self.env,
                 parser=self.parser,
                 feedback_manager=self.feedback_manager,
@@ -467,7 +468,7 @@ def main(args):
         overwrite=True,
         skip_display=args.skip_display,
         llm_output_mode=args.output_mode, # "action_only" or "action_and_path"
-        llm_comm_mode=args.comm_mode, # "chat" or "plan"
+        llm_comm_mode=args.comm_mode, # "chat", "plan", or "step"
         llm_num_replans=args.num_replans,
         policy_kwargs=dict(
             control_freq=args.control_freq,
@@ -498,7 +499,7 @@ if __name__ == "__main__":
     parser.add_argument("--tsteps", "-t", type=int, default=10)
     parser.add_argument("--task", type=str, default="cabinet")
     parser.add_argument("--output_mode", type=str, default="action_only", choices=["action_only", "action_and_path"])
-    parser.add_argument("--comm_mode", type=str, default="chat", choices=["chat", "plan", "dialog"])
+    parser.add_argument("--comm_mode", type=str, default="chat", choices=["chat", "plan", "dialog", "step"])
     parser.add_argument("--control_freq", "-cf", type=int, default=15)
     parser.add_argument("--skip_display", "-sd", action="store_true")
     parser.add_argument("--direct_waypoints", "-dw", type=int, default=5)
@@ -513,7 +514,7 @@ if __name__ == "__main__":
     parser.add_argument("--split_parsed_plans", "-sp", action="store_true")
     parser.add_argument("--no_history", "-nh", action="store_true")
     parser.add_argument("--no_feedback", "-nf", action="store_true")
-    parser.add_argument("--llm_source", "-llm", type=str, default="llama3.3:latest") # You can choose one model here.
+    parser.add_argument("--llm_source", "-llm", type=str, default=os.environ.get("ROCOBENCH_LLM_SOURCE", "qwen3:8b")) # You can choose one model here.
     parser.add_argument("--seed", "-seed", type=int, default=0)
     parser.add_argument("--run_timeout", "-rt", type=float, default=600, help="Timeout for each run in seconds (default: 600s = 10min)")
     logging.basicConfig(level=logging.INFO)

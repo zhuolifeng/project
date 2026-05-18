@@ -11,7 +11,6 @@ from datetime import datetime
 from .feedback import FeedbackManager
 from .parser import LLMResponseParser
 from .ollama_client import query_ollama_chat
-from .context_compactor import compact_items, compact_text
 from typing import List, Tuple, Dict, Union, Optional, Any
 
 PATH_PLAN_INSTRUCTION="""
@@ -114,16 +113,16 @@ class SingleThreadPrompter:
         for i, history in enumerate(self.round_history):
             match = re.search(pattern, history)
             history_f = match.group(1).strip() if match else history
-            ret += f"== Round#{i} ==\n{compact_text(history_f)}\n"
+            ret += f"== Round#{i} ==\n{history_f}\n"
         ret += "== Current Round ==\n"
         return ret
 
     def compose_round_history_brief(self):
         if len(self.round_history_brief) == 0:
-            return self.compose_round_history()
+            return ""
         ret = "[History]\n"
         for i, history in enumerate(self.round_history_brief):
-            ret += f"== Round#{i} ==\n{compact_text(history)}\n"
+            ret += f"== Round#{i} ==\n{history}\n"
         ret += f"== Current Round ==\n"
         return ret
 
@@ -179,12 +178,12 @@ class SingleThreadPrompter:
 
         if len(self.failed_plans) > 0:
             execute_feedback = "以下计划执行失败，请对其进行优化以避免碰撞并平稳抵达目标：\n"
-            execute_feedback += "\n".join(compact_items(self.failed_plans)) 
+            execute_feedback += "\n".join(self.failed_plans) 
             full_prompt += execute_feedback + "\n"
 
         if len(plan_feedbacks) > 0:
             feedback_prompt = "先前的计划是不可行的，思考原因并避免:\n"
-            feedback_prompt += "\n".join(compact_items(plan_feedbacks)) + "\n"
+            feedback_prompt += "\n".join(plan_feedbacks) + "\n"
             full_prompt += feedback_prompt
         
         if self.comm_mode == "plan":
@@ -298,6 +297,7 @@ Re-format to strictly follow [Action Output Instruction]!
 
                 print('======= response ======= \n ', response)
                 print('======= usage ======= \n ', usage)
+                response = self.response_formatter(response)
                 break
             except Exception as exc:
                 print(f"API error, try again: {exc}")
@@ -308,6 +308,24 @@ Re-format to strictly follow [Action Output Instruction]!
                 f"after {self.max_api_queries} attempts"
             )
         return response, usage
+
+    def response_formatter(self, response):
+        format_prompt = (
+            f"我要求的格式为：<format>{self.get_action_output_instruction(isinstance(self.env, MakeSandwichTask))}</format>\n。"
+            f"根据下面的内容，提供符合上面格式的输出：<content>{response}</content>。"
+            "将你的回答用<formatted></formatted>包裹。"
+        )
+        formatted_response, _ = query_ollama_chat(
+            model=self.llm_source,
+            system_prompt="你是一个专业的信息格式化助手，我需要你根据我提供的format，格式化我提供的content",
+            user_prompt=format_prompt,
+            temperature=0,
+            max_tokens=65536,
+        )
+        print("====== formatted ======\n", formatted_response)
+        if "<formatted>" in formatted_response and "</formatted>" in formatted_response:
+            return formatted_response.split("<formatted>")[-1].split("</formatted>")[0]
+        return formatted_response
 
     
 
@@ -322,13 +340,13 @@ Re-format to strictly follow [Action Output Instruction]!
     def _extract_summary(self, summary_response: str) -> str:
         match = re.search(r"<summary>(.*?)</summary>", summary_response, re.DOTALL)
         if match:
-            return compact_text(match.group(1).strip())
-        return compact_text(summary_response, max_chars=600)
+            return match.group(1).strip()
+        return summary_response.strip()
 
     def _summarize_round(self, obs_desp, parsed_plan: str) -> str:
         after_obs = self._describe_obs_for_summary(obs_desp).replace("[Scene description]", "")
         before_obs = (self.old_obs_desp or "").replace("[Scene description]", "")
-        responses = "\n".join(compact_items(self.response_history))
+        responses = "\n".join(self.response_history)
         summarize_prompt = "<Task Information>"
         summarize_prompt += f"The task descriptions are as follows:\n<Task Description>{self.env.describe_task_context()}</Task Description>\n\n"
         summarize_prompt += f"The action descriptions are as follows:\n<Action Description>{self.env.get_action_prompt()}</Action Description>\n\n"
@@ -352,7 +370,7 @@ Re-format to strictly follow [Action Output Instruction]!
         if execute_success: 
             # clear failed plans, count the previous execute as full past round in history
             self.failed_plans = []
-            responses = "\n".join(compact_items(self.response_history))
+            responses = "\n".join(self.response_history)
             self.round_history.append(
                 f"[Response History]\n{responses}\n{obs_desp}\n[Executed Action]\n{parsed_plan}"
             )
@@ -360,10 +378,10 @@ Re-format to strictly follow [Action Output Instruction]!
                 self.round_history_brief.append(self._summarize_round(obs_desp, parsed_plan))
             except Exception as exc:
                 print(f"Summary generation failed, falling back to compact action history: {exc}")
-                self.round_history_brief.append(compact_text(parsed_plan))
+                self.round_history_brief.append(parsed_plan)
         else:
             self.failed_plans.append(
-                compact_text(parsed_plan)
+                parsed_plan
             )
         return
 
