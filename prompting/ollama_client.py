@@ -5,6 +5,20 @@ import requests
 
 
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
+DEFAULT_RETRY_MULTIPLIER = 4
+
+
+def _parse_ollama_think(value: str) -> Any:
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    if normalized in {"low", "medium", "high"}:
+        return normalized
+    raise ValueError(
+        "OLLAMA_THINK must be one of: true, false, low, medium, high"
+    )
 
 
 def query_ollama_chat(
@@ -17,6 +31,8 @@ def query_ollama_chat(
     """Query a local Ollama chat model and return response text plus metadata."""
     base_url = os.environ.get("OLLAMA_HOST", DEFAULT_OLLAMA_URL).rstrip("/")
     timeout = float(os.environ.get("OLLAMA_TIMEOUT", "300"))
+    think_value = os.environ.get("OLLAMA_THINK")
+    think = _parse_ollama_think(think_value) if think_value is not None else None
 
     messages = [{"role": "system", "content": system_prompt}]
     if user_prompt:
@@ -26,17 +42,52 @@ def query_ollama_chat(
     if max_tokens is not None:
         options["num_predict"] = max_tokens
 
-    payload = {
+    payload: Dict[str, Any] = {
         "model": model,
         "messages": messages,
         "stream": False,
         "options": options,
     }
+    if think is not None:
+        payload["think"] = think
 
     response = requests.post(f"{base_url}/api/chat", json=payload, timeout=timeout)
     response.raise_for_status()
     data = response.json()
-    text = data.get("message", {}).get("content", "")
+    message = data.get("message", {})
+    text = message.get("content", "")
     if not text:
-        raise RuntimeError("Ollama returned an empty chat response")
+        thinking = message.get("thinking", "")
+        done_reason = data.get("done_reason", "unknown")
+        eval_count = data.get("eval_count", "unknown")
+        if thinking and max_tokens is not None:
+            retry_options = dict(options)
+            retry_options["num_predict"] = max(
+                max_tokens + 256,
+                max_tokens * DEFAULT_RETRY_MULTIPLIER,
+            )
+            retry_payload = dict(payload)
+            retry_payload["options"] = retry_options
+            response = requests.post(
+                f"{base_url}/api/chat",
+                json=retry_payload,
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            data = response.json()
+            message = data.get("message", {})
+            text = message.get("content", "")
+            if text:
+                return text, data
+
+        hint = ""
+        if thinking:
+            hint = (
+                " The model produced thinking tokens but no final content; "
+                "increase max_tokens or set OLLAMA_THINK=false."
+            )
+        raise RuntimeError(
+            "Ollama returned an empty chat response "
+            f"(done_reason={done_reason}, eval_count={eval_count}).{hint}"
+        )
     return text, data

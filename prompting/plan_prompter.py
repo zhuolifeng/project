@@ -9,6 +9,7 @@ from datetime import datetime
 from .feedback import FeedbackManager
 from .parser import LLMResponseParser
 from .ollama_client import query_ollama_chat
+from .context_compactor import compact_items, compact_text
 from typing import List, Tuple, Dict, Union, Optional, Any
 
 PATH_PLAN_INSTRUCTION="""
@@ -108,7 +109,7 @@ class SingleThreadPrompter:
             return ""
         ret = "[History]\n"
         for i, history in enumerate(self.round_history):
-            ret += f"== Round#{i} ==\n{history}"
+            ret += f"== Round#{i} ==\n{compact_text(history)}"
         ret += f"== Current Round ==\n"
         return ret
         
@@ -133,12 +134,12 @@ class SingleThreadPrompter:
 
         if len(self.failed_plans) > 0:
             execute_feedback = "Plans below failed to execute, improve them to avoid collision and smoothly reach the targets:\n"
-            execute_feedback += "\n".join(self.failed_plans) 
+            execute_feedback += "\n".join(compact_items(self.failed_plans)) 
             full_prompt += execute_feedback + "\n"
 
         if len(plan_feedbacks) > 0:
             feedback_prompt = "Previous Plans Require Improvement:\n"
-            feedback_prompt += "\n".join(plan_feedbacks) + "\n"
+            feedback_prompt += "\n".join(compact_items(plan_feedbacks)) + "\n"
             full_prompt += feedback_prompt
         
         if self.comm_mode == "plan":
@@ -255,6 +256,11 @@ Re-format to strictly follow [Action Output Instruction]!
             except Exception as exc:
                 print(f"API error, try again: {exc}")
             continue
+        if response is None:
+            raise RuntimeError(
+                f"Failed to query Ollama model {self.llm_source!r} "
+                f"after {self.max_api_queries} attempts"
+            )
         return response, usage
 
     
@@ -263,13 +269,13 @@ Re-format to strictly follow [Action Output Instruction]!
         if execute_success: 
             # clear failed plans, count the previous execute as full past round in history
             self.failed_plans = []
-            responses = "\n".join(self.response_history)
+            responses = "\n".join(compact_items(self.response_history))
             self.round_history.append(
                 f"[Response History]\n{responses}\n{obs_desp}\n[Executed Action]\n{parsed_plan}"
             )
         else:
             self.failed_plans.append(
-                parsed_plan
+                compact_text(parsed_plan)
             )
         return
 

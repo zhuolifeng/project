@@ -14,6 +14,7 @@ from rocobench.envs import MujocoSimEnv, EnvState
 from .feedback import FeedbackManager
 from .parser import LLMResponseParser
 from .ollama_client import query_ollama_chat
+from .context_compactor import compact_items, compact_text
 
 
 PATH_PLAN_INSTRUCTION="""
@@ -90,15 +91,16 @@ class DialogPrompter:
             execute_feedback = "Plans below failed to execute, improve them to avoid collision and smoothly reach the targets:\n"
             execute_feedback += "\n".join(self.failed_plans) + "\n"
 
+        chat_history = compact_items(chat_history)
         chat_history = "[Previous Chat]\n" + "\n".join(chat_history) if len(chat_history) > 0 else ""
             
         system_prompt = f"{action_desp}\n{round_history}\n{execute_feedback}{agent_prompt}\n{chat_history}\n" 
         
         if self.use_feedback and len(feedback_history) > 0:
-            system_prompt += "\n".join(feedback_history)
+            system_prompt += "\n".join(compact_items(feedback_history))
         
         if len(current_chat) > 0:
-            system_prompt += "[Current Chat]\n" + "\n".join(current_chat) + "\n"
+            system_prompt += "[Current Chat]\n" + "\n".join(compact_items(current_chat)) + "\n"
 
         return system_prompt 
 
@@ -107,7 +109,7 @@ class DialogPrompter:
             return ""
         ret = "[History]\n"
         for i, history in enumerate(self.round_history):
-            ret += f"== Round#{i} ==\n{history}\n"
+            ret += f"== Round#{i} ==\n{compact_text(history)}\n"
         ret += f"== Current Round ==\n"
         return ret
     
@@ -222,7 +224,7 @@ Your response is:
 
                 num_responses[agent_name] += 1
                 # strip all the repeated \n and blank spaces in response: 
-                pruned_response = response.strip()
+                pruned_response = compact_text(response)
                 # pruned_response = pruned_response.replace("\n", " ")
                 agent_responses.append(
                     f"[{agent_name}]:\n{pruned_response}"
@@ -277,6 +279,11 @@ Your response is:
                 print(f"API error, try again: {exc}")
                 time.sleep(2)
             continue
+        if response is None:
+            raise RuntimeError(
+                f"Failed to query Ollama model {self.llm_source!r} "
+                f"after {max_query} attempts"
+            )
         # breakpoint()
         return response, usage
     
@@ -290,7 +297,7 @@ Your response is:
             )
         else:
             self.failed_plans.append(
-                parsed_plan
+                compact_text(parsed_plan)
             )
         return 
 
