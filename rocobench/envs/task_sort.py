@@ -56,6 +56,7 @@ Planning checklist for this task:
 - If feedback reports reachability, IK, parsing, or execution failure, do not repeat the same failed action; choose a reachable handoff, a reachable target placement, or WAIT only for the blocked robot.
 - In one EXECUTE block, output exactly one line for Alice, one line for Bob, and one line for Chad; do not repeat or omit any robot.
 - In one EXECUTE block, do not assign the same cube to more than one robot. If two useful actions would use the same pickup area, choose one and set the other robot to WAIT.
+- If two unsorted cubes are on the same shared panel, move only one of them in the current EXECUTE block; this avoids crowding at the same pickup area.
 """
  
 SORT_TASK_DIALOG_PROMPT=""
@@ -79,9 +80,11 @@ PLACE without PICK is invalid. Always write object movement exactly as: PICK <ob
 Never place a cube on a panel outside that robot's reachable panels. Valid target map is blue_square -> panel2, pink_polygon -> panel4, yellow_trapezoid -> panel6.
 Never use PICK <object> PLACE <same current panel>; it is a no-op and invalid.
 Do not chain dependent handoff actions in one EXECUTE block; the receiver may only PICK after the cube is already on its reachable panel in the current scene.
+If two cubes are on panel3 or panel5, only one robot may PICK from that panel in the current EXECUTE block; the other robot must WAIT.
 [Action Output Instruction]
 You must first output 'EXECUTE\n', then give **exactly** one action per robot, put each on a new line.
 The three lines must be in this exact robot set: Alice, Bob, Chad.
+Output raw plain text only. Do not wrap the EXECUTE block in markdown fences or add analysis before it.
 Example: 'EXECUTE\nNAME Alice ACTION PICK blue_square PLACE panel2\nNAME Bob ACTION WAIT\nNAME Chad ACTION PICK yellow_trapezoid PLACE panel6\n'
 """
 

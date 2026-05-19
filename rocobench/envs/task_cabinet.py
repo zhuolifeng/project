@@ -42,6 +42,7 @@ CABINET_ACTION_SPACE="""
 Use only these four action forms. Never invent MOVE, MOVE TO, GO TO, or coordinate-only actions.
 After reachability feedback, never repeat the exact same failed PICK/PLACE action for the same robot and object.
 If feedback says "Out of reach: Chad" for cup or mug, Chad must not PICK that object again in the next EXECUTE block.
+Output raw plain text only. Do not wrap the EXECUTE block in markdown fences or add analysis before it.
 
 [Action Output Instruction]
 Must first output 'EXECUTE\n', then give **exactly** one action per robot, put each on a new line.
@@ -55,6 +56,7 @@ Each robot does **exactly** one ACTION per round, selected from only one of the 
 Planning checklist for this task:
 - Phase 1: PICK/OPEN both door handles; after a door is open, that robot should WAIT to hold it open.
 - Phase 2: only when both doors are open and held open, PICK mug PLACE mug_coaster and PICK cup PLACE cup_coaster.
+- If Alice is holding a door handle and cup is still inside cabinet, Alice may leave the handle and directly output PICK cup PLACE cup_coaster; this is the required recovery action when Alice is the only valid cup robot.
 - Move at most one object among mug/cup per EXECUTE block. Do not PICK mug and cup in the same round.
 - For mug/cup, choose the robot that can currently reach the object's present position and the target coaster; do not assume Chad should always manipulate objects.
 - Respect each agent prompt's reachable objects. If feedback says an object or handle is unreachable, do not repeat the same failed action or same failed EXECUTE block.
@@ -494,7 +496,8 @@ Current cabinet-side reachability:
 - Alice can reach left_door_handle, mug, cup.
 - Bob can reach right_door_handle only; Bob must not PICK mug or cup.
 - Chad can reach right_door_handle and mug. In this benchmark, Chad must not PICK cup; assign cup to Alice.
-- If Alice is holding left_door_handle or Bob is holding right_door_handle, WAIT is preferred to keep the door open, but Alice may recover mug or cup when the object is no longer inside the cabinet and Chad failed to reach it.
+- If cup is inside cabinet and mug is already on its coaster, Alice should PICK cup PLACE cup_coaster even if she is holding left_door_handle. Bob should WAIT to keep right_door_handle open and Chad should WAIT.
+- If Alice is holding left_door_handle or Bob is holding right_door_handle, WAIT is preferred only when no valid object action is needed.
 """
         else:
             context += """
