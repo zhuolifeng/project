@@ -70,6 +70,7 @@ SORTING_ACTION_SPACE="""
 1) PICK <object name> PLACE <location>
 2) WAIT
 Only PICK an object if your gripper is empty. Target <location> for PLACE should be panel or a bin.
+PLACE without PICK is invalid. Always write object movement exactly as: PICK <object name> PLACE <panel>.
 Never place a cube on a panel outside that robot's reachable panels. Valid target map is blue_square -> panel2, pink_polygon -> panel4, yellow_trapezoid -> panel6.
 Do not chain dependent handoff actions in one EXECUTE block; the receiver may only PICK after the cube is already on its reachable panel in the current scene.
 [Action Output Instruction]

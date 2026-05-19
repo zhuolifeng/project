@@ -41,6 +41,7 @@ CABINET_ACTION_SPACE="""
 <object> must be either mug or cup, <location> must be the correct coaster.
 Use only these four action forms. Never invent MOVE, MOVE TO, GO TO, or coordinate-only actions.
 After reachability feedback, never repeat the exact same failed PICK/PLACE action for the same robot and object.
+If feedback says "Out of reach: Chad" for cup or mug, Chad must not PICK that object again in the next EXECUTE block.
 
 [Action Output Instruction]
 Must first output 'EXECUTE\n', then give **exactly** one action per robot, put each on a new line.
@@ -56,7 +57,7 @@ Planning checklist for this task:
 - Phase 2: only when both doors are open and held open, PICK mug PLACE mug_coaster and PICK cup PLACE cup_coaster.
 - For mug/cup, choose the robot that can currently reach the object's present position and the target coaster; do not assume Chad should always manipulate objects.
 - Respect each agent prompt's reachable objects. If feedback says an object or handle is unreachable, do not repeat the same failed action or same failed EXECUTE block.
-- If Chad fails to reach cup or mug once, Chad must WAIT on the next replan for that object, and another reachable robot must be assigned if one exists.
+- If Chad fails to reach cup or mug once, Chad must WAIT on the next replan for that object, and another reachable robot must be assigned if one exists. If no reachable robot exists, do not repeat Chad's failed action.
 - If an object manipulation fails or the object is no longer inside the cabinet, re-evaluate from the current Scene description and choose a robot/action valid for the object's current position.
 - Do not output all WAIT unless both mug and cup are already on their correct coasters.
 """
@@ -468,6 +469,22 @@ End your response by either: 1) output PROCEED, if the plans require further dis
 
     def describe_task_context(self):
         context = CABINET_TASK_CONTEXT
+        if self.cabinet_pos[0] < 0:
+            context += """
+Current cabinet-side reachability:
+- Alice can reach left_door_handle, mug, cup.
+- Bob can reach right_door_handle only; Bob must not PICK mug or cup.
+- Chad can reach right_door_handle, mug, cup.
+- If Alice is holding left_door_handle or Bob is holding right_door_handle, that robot should WAIT to keep the door open and should not PICK mug or cup in the same round.
+"""
+        else:
+            context += """
+Current cabinet-side reachability:
+- Alice can reach right_door_handle, mug, cup.
+- Bob can reach left_door_handle, mug, cup.
+- Chad can reach left_door_handle only; Chad must not PICK mug or cup.
+- If Alice is holding right_door_handle or Bob is holding left_door_handle, that robot should WAIT to keep the door open and should not PICK mug or cup in the same round.
+"""
         return context
 
     def get_contact(self):
