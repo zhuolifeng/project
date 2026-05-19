@@ -70,13 +70,6 @@ def pack_hint(env: MujocoSimEnv, obs: EnvState) -> str:
 
     held_in_round = set(filter(None, [alice_inhand, bob_inhand]))
 
-    def _slot_x(slot):
-        xy = slot_xposes.get(slot)
-        try:
-            return float(xy[0])
-        except Exception:
-            return 0.0
-
     def _pick_candidate(prefer_robot, taken_items):
         # nearest unpacked, currently-on-table item to this robot's gripper y
         candidates = []
@@ -91,25 +84,15 @@ def pack_hint(env: MujocoSimEnv, obs: EnvState) -> str:
                 continue
             if "bin_inside" in getattr(o, "contacts", []):
                 continue
-            candidates.append((name, float(xpos[0]), float(xpos[1])))
+            candidates.append((name, float(xpos[1])))
         if not candidates:
             return None
-        # E4: if remaining empty slots cluster on one x-side, prefer items whose
-        # x already matches that side so we don't leave only same-side slots for last.
-        remaining_xs = [_slot_x(s) for s in empty_slots if s not in taken_slots]
-        side_target = None
-        if remaining_xs:
-            if min(remaining_xs) > 0.55:
-                side_target = max(remaining_xs)  # all right -> pull right-side items first
-            elif max(remaining_xs) < 0.35:
-                side_target = min(remaining_xs)  # all left -> pull left-side items first
         ee_y = _ee_y(alice_state if prefer_robot == "Alice" else bob_state)
-        if side_target is not None:
-            return min(candidates, key=lambda c: abs(c[1] - side_target))[0]
         if ee_y is None:
-            return min(candidates, key=lambda c: c[2])[0] if prefer_robot == "Alice" \
-                else max(candidates, key=lambda c: c[2])[0]
-        return min(candidates, key=lambda c: abs(c[2] - ee_y))[0]
+            # fall back: Alice prefers small y (front), Bob prefers large y (back)
+            return min(candidates, key=lambda kv: kv[1])[0] if prefer_robot == "Alice" \
+                else max(candidates, key=lambda kv: kv[1])[0]
+        return min(candidates, key=lambda kv: abs(kv[1] - ee_y))[0]
 
     taken_slots, taken_items = set(), set()
     alice_line, bob_line = "", ""
@@ -144,23 +127,6 @@ def pack_hint(env: MujocoSimEnv, obs: EnvState) -> str:
         else:
             bob_line = "Bob (empty gripper): nothing left to pick, WAIT"
 
-    # E1: same-x-side PLACE deadlock breaker.
-    # When both robots hold items AND all remaining empty slots are clustered on the
-    # right (x > 0.55), Bob's path from far left to bin_back_right tends to make RRT
-    # time out because Alice's PLACE is also on the right. Serialize: keep Bob PICK
-    # this round (drop to a fresh pick target). If Bob also holds, give a detour hint.
-    deadlock_hint = ""
-    rem_slots = [s for s in empty_slots if s not in taken_slots]
-    rem_xs = [_slot_x(s) for s in rem_slots]
-    if alice_inhand and bob_inhand and rem_xs and min(rem_xs) > 0.55:
-        deadlock_hint = (
-            "- [Same-Side PLACE Deadlock] All remaining empty slots are on the right (x > 0.55). "
-            "Parallel PLACE here usually makes RRT time out. Bob MUST take a detour path: go via the "
-            "back corridor — first waypoint near (-0.5, 0.7, 0.55), second near (0.0, 0.7, 0.55), "
-            "third near (0.45, 0.65, 0.5), final at the bin_back_right slot. Alice keeps y <= 0.45 "
-            "going straight to bin_front_right.\n"
-        )
-
     return (
         "[Pack Hard Rules]\n"
         "- Reachability (from env): Alice (ur5e_robotiq) reaches y in [-0.4, 1.5]; Bob (panda) reaches y in [0, 1.5].\n"
@@ -172,7 +138,6 @@ def pack_hint(env: MujocoSimEnv, obs: EnvState) -> str:
         "- [Row Split] Alice -> front-row slot, Bob -> back-row slot (use a middle slot only if its row is exhausted).\n"
         "- [Non-Crossing Corridor] To avoid mid-air path conflict during parallel PLACE: ALL of Alice's PATH waypoints MUST have y <= 0.45; ALL of Bob's PATH waypoints MUST have y >= 0.55. Pick approach/lift waypoints that respect this corridor so the two arms never cross.\n"
         "- [No WAIT] PackGroceryTask does NOT accept WAIT/MOVE; every round each robot MUST output PICK or PLACE.\n"
-        f"{deadlock_hint}"
         "[Pack Round Assignment] (follow unless physically impossible):\n"
         f"  - {alice_line}\n"
         f"  - {bob_line}\n"
