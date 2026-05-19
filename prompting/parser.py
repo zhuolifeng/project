@@ -4,6 +4,7 @@ from rocobench.subtask_plan import LLMPathPlan
 from typing import List, Tuple, Dict, Union, Optional, Any
 from rocobench.envs import MujocoSimEnv, EnvState, RobotState
 from scipy.spatial.transform import Rotation, Slerp
+from .text_utils import strip_think
 
 class LLMResponseParser:
     """
@@ -31,20 +32,23 @@ class LLMResponseParser:
         self.use_preplace = use_preplace # if True, separate pre-place and place actions
         self.split_parsed_plans = split_parsed_plans 
 
-    def parse(self, obs: EnvState, response: str) -> Tuple[bool, str, List[LLMPathPlan]]: 
-        parsed = ''  
+    def parse(self, obs: EnvState, response: str) -> Tuple[bool, str, List[LLMPathPlan]]:
+        parsed = ''
+        response = strip_think(response or "")
+        if 'EXECUTE' not in response:
+            return False, "Response missing 'EXECUTE' header.", []
         for keyword in self.response_keywords:
-            if keyword not in response: 
+            if keyword not in response:
                 return False, f"Response does not contain {keyword}." , []
         for agent_name in self.robot_agent_names.values():
             if agent_name not in response:
                 return False, f"Response missing plan for robot {agent_name}.", []
-        
-        robot_states = dict() 
+
+        robot_states = dict()
         for robot_name, agent_name in self.robot_agent_names.items():
             robot_state = getattr(obs, robot_name)
-            robot_states[agent_name] = robot_state 
-        
+            robot_states[agent_name] = robot_state
+
         execute_str = response.split('EXECUTE')[1]
         # find the \n to split the string into line by line
         lines = execute_str.split('\n')
@@ -960,20 +964,36 @@ class LLMResponseParser:
         return True, "parse success", put_plan
 
     def parse_path_string(self, path_string: str):
-        # Given a string such as '[(0.00,0.50,0.10), (0.00,0.50,0.10)].' 
+        # Given a string such as '[(0.00,0.50,0.10), (0.00,0.50,0.10)].'
         # convert it to a list of tuples of floats using regular expression match  re.
         triplet_strs = re.findall(r"\(([^)]+)\)", path_string)
+        if not triplet_strs:
+            return None
         if ',' not in triplet_strs[0]:
             return None
-        # remove all the non-numerical characters, e.g. parse "\"0.7" into "0.7", parse "?\"-1.2" into "-1.2" 
+        # remove all the non-numerical characters, e.g. parse "\"0.7" into "0.7", parse "?\"-1.2" into "-1.2"
 
         tuples = [
             tuple([
                 float(
                     re.sub(r"[^0-9\.\-]", "", x)
                     ) for x in triplet_str.split(",")]) for triplet_str in triplet_strs
-        ] 
-        return tuples 
+        ]
+
+        # Soft repair: normalize tuple count to exactly 4 when it is 3 or 5.
+        if len(tuples) == 3:
+            old_len = len(tuples)
+            midpoint = tuple(
+                (a + b) / 2.0 for a, b in zip(tuples[1], tuples[2])
+            )
+            tuples = [tuples[0], tuples[1], midpoint, tuples[2]]
+            print(f"[soft-repair] path normalized {old_len}->4")
+        elif len(tuples) == 5:
+            old_len = len(tuples)
+            tuples = [tuples[0], tuples[1], tuples[3], tuples[4]]
+            print(f"[soft-repair] path normalized {old_len}->4")
+
+        return tuples
 
     def parse_path(self, line: str) -> List[Tuple[float, float, float]]:
         """ 

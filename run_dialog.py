@@ -126,7 +126,7 @@ class LLMRunner:
                 env=self.env,
                 parser=self.parser,
                 feedback_manager=self.feedback_manager,
-                max_tokens=65536,
+                max_tokens=2048,
                 debug_mode=self.debug_mode,
                 use_waypoints=(self.llm_output_mode == "action_and_path"),
                 use_history=self.use_history,
@@ -141,7 +141,7 @@ class LLMRunner:
                 env=self.env,
                 parser=self.parser,
                 feedback_manager=self.feedback_manager,
-                max_tokens=65536,
+                max_tokens=2048,
                 debug_mode=self.debug_mode,
                 robot_name_map=self.env.robot_name_map,
                 max_calls_per_round=10,
@@ -513,7 +513,7 @@ if __name__ == "__main__":
     parser.add_argument("--split_parsed_plans", "-sp", action="store_true")
     parser.add_argument("--no_history", "-nh", action="store_true")
     parser.add_argument("--no_feedback", "-nf", action="store_true")
-    parser.add_argument("--llm_source", "-llm", type=str, default="llama3.3:latest") # You can choose one model here.
+    parser.add_argument("--llm_source", "-llm", type=str, default="qwen3:32b") # You can choose one model here.
     parser.add_argument("--seed", "-seed", type=int, default=0)
     parser.add_argument("--run_timeout", "-rt", type=float, default=600, help="Timeout for each run in seconds (default: 600s = 10min)")
     logging.basicConfig(level=logging.INFO)
