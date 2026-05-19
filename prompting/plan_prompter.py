@@ -11,6 +11,7 @@ from datetime import datetime
 from .feedback import FeedbackManager
 from .parser import LLMResponseParser
 from .ollama_client import query_ollama_chat
+from .task_hints import build_task_hint
 from typing import List, Tuple, Dict, Union, Optional, Any
 
 PATH_PLAN_INSTRUCTION="""
@@ -145,9 +146,10 @@ class SingleThreadPrompter:
     def compose_system_prompt(
         self,
         obs_desp: str,
-        plan_feedbacks: List[str] = [], 
+        plan_feedbacks: List[str] = [],
+        obs: EnvState = None,
         ):
-        
+
         self.old_obs_desp = obs_desp
 
         task_desp = self.env.describe_task_context() # should include task rules
@@ -163,13 +165,13 @@ class SingleThreadPrompter:
         if self.use_waypoints:
             action_desp += PATH_PLAN_INSTRUCTION
 
-        full_prompt = f"{task_desp}\n{action_desp}\n" 
-        
+        full_prompt = f"{task_desp}\n{action_desp}\n"
+
         if self.use_history:
-            history_desp = self.compose_round_history_brief() 
+            history_desp = self.compose_round_history_brief()
             if isinstance(self.env, MakeSandwichTask):
                 history_desp = self.compose_round_history()
-            full_prompt += history_desp + "\n" 
+            full_prompt += history_desp + "\n"
 
         if isinstance(self.env, SweepTask):
             object_desp = "[Scene description]\n"
@@ -181,33 +183,45 @@ class SingleThreadPrompter:
             obs_desp = object_desp + robot_desp
         full_prompt += obs_desp + "\n"
 
+        if obs is not None:
+            task_hint = build_task_hint(self.env, obs)
+            if task_hint:
+                full_prompt += task_hint + "\n"
+
         if len(self.failed_plans) > 0:
             execute_feedback = "以下计划执行失败，请对其进行优化以避免碰撞并平稳抵达目标：\n"
             execute_feedback += "\n".join(self.failed_plans)
+            execute_feedback += "\n[Hard Rule] Do NOT re-emit any of the failed plans above. If reachability/collision/constraint failed, change the action or assign it to the other robot.\n"
             full_prompt += execute_feedback + "\n"
 
         if len(plan_feedbacks) > 0:
             feedback_prompt = "先前的计划是不可行的，思考原因并避免:\n"
             feedback_prompt += "\n".join(plan_feedbacks) + "\n"
             full_prompt += feedback_prompt
-        
+
         if self.comm_mode == "plan":
             comm_prompt = get_plan_prompt(self.env)
         elif self.comm_mode == "chat":
-            comm_prompt = get_chat_prompt(self.env) 
+            comm_prompt = get_chat_prompt(self.env)
         else:
             raise NotImplementedError
         full_prompt += self.get_action_output_instruction(isinstance(self.env, MakeSandwichTask))
         full_prompt += comm_prompt
+        full_prompt += (
+            "\n[Think-then-Execute]\n"
+            "Before the EXECUTE block, output one THINK line per robot in the form:\n"
+            "  THINK <RobotName>: <which item, why this robot, how it avoids the previous failure>\n"
+            "Then output exactly one EXECUTE block as specified above.\n"
+        )
 
-        return full_prompt 
+        return full_prompt
 
-    def prompt_one_round(self, obs: EnvState, save_path: str = ""): 
+    def prompt_one_round(self, obs: EnvState, save_path: str = ""):
         plan_feedbacks = []
         response_history = []
         obs_desp = self.env.describe_obs(obs)
-        for i in range(self.num_replans): 
-            system_prompt = self.compose_system_prompt(obs_desp, plan_feedbacks)
+        for i in range(self.num_replans):
+            system_prompt = self.compose_system_prompt(obs_desp, plan_feedbacks, obs=obs)
             response, usage = self.query_once(
                 system_prompt, user_prompt=""
                 ) # NOTE: single_thread doesn't use user role
@@ -384,7 +398,7 @@ Re-format to strictly follow [Action Output Instruction]!
         return actions
 
     def post_execute_update(self, obs_desp: str, execute_success: bool, parsed_plan: str):
-        if execute_success: 
+        if execute_success:
             # clear failed plans, count the previous execute as full past round in history
             self.failed_plans = []
             self.last_executed_actions = self._parse_executed_actions(parsed_plan)
