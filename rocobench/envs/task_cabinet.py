@@ -59,6 +59,8 @@ Planning checklist for this task:
 - Respect each agent prompt's reachable objects. If feedback says an object or handle is unreachable, do not repeat the same failed action or same failed EXECUTE block.
 - If Chad fails to reach cup or mug once, Chad must WAIT on the next replan for that object, and another reachable robot must be assigned if one exists. If no reachable robot exists, do not repeat Chad's failed action.
 - If an object manipulation fails or the object is no longer inside the cabinet, re-evaluate from the current Scene description and choose a robot/action valid for the object's current position.
+- If cup or mug is no longer inside the cabinet and is not on its coaster, recovery has priority over holding doors open.
+- If cup has an abnormal position with y >= 1.0 or z <= 0.0, do not assign Chad to PICK cup again; choose Alice if reachable, otherwise do not repeat the failed cup action.
 - Do not output all WAIT unless both mug and cup are already on their correct coasters.
 """
 CABINET_TASK_CHAT_PROMPT="""Robots discuss to find the best strategy. When each robot talk, it must first reflects on the task status, and its own capability. 
@@ -475,7 +477,7 @@ Current cabinet-side reachability:
 - Alice can reach left_door_handle, mug, cup.
 - Bob can reach right_door_handle only; Bob must not PICK mug or cup.
 - Chad can reach right_door_handle, mug, cup.
-- If Alice is holding left_door_handle or Bob is holding right_door_handle, that robot should WAIT to keep the door open and should not PICK mug or cup in the same round.
+- If Alice is holding left_door_handle or Bob is holding right_door_handle, WAIT is preferred to keep the door open, but Alice may recover mug or cup when the object is no longer inside the cabinet and Chad failed to reach it.
 """
         else:
             context += """
@@ -483,7 +485,7 @@ Current cabinet-side reachability:
 - Alice can reach right_door_handle, mug, cup.
 - Bob can reach left_door_handle, mug, cup.
 - Chad can reach left_door_handle only; Chad must not PICK mug or cup.
-- If Alice is holding right_door_handle or Bob is holding left_door_handle, that robot should WAIT to keep the door open and should not PICK mug or cup in the same round.
+- If Alice is holding right_door_handle or Bob is holding left_door_handle, WAIT is preferred to keep the door open, but Alice or Bob may recover mug or cup when the object is no longer inside the cabinet and the assigned robot failed to reach it.
 """
         return context
 
