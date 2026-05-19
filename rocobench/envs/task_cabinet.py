@@ -40,9 +40,6 @@ CABINET_ACTION_SPACE="""
 <handle> must be either left or right door handle. Only OPEN a door after you already PICKed its handle, after you OPENed a door, must WAIT at the same spot to hold it open. 
 <object> must be either mug or cup, <location> must be the correct coaster.
 Use only these four action forms. Never invent MOVE, MOVE TO, GO TO, or coordinate-only actions.
-After reachability feedback, never repeat the exact same failed PICK/PLACE action for the same robot and object.
-If feedback says "Out of reach: Chad" for cup or mug, Chad must not PICK that object again in the next EXECUTE block.
-Output raw plain text only. Do not wrap the EXECUTE block in markdown fences or add analysis before it.
 
 [Action Output Instruction]
 Must first output 'EXECUTE\n', then give **exactly** one action per robot, put each on a new line.
@@ -55,17 +52,9 @@ At each round, given 'Scene description' and 'Environment feedback', use it to r
 Each robot does **exactly** one ACTION per round, selected from only one of the above 4 options.
 Planning checklist for this task:
 - Phase 1: PICK/OPEN both door handles; after a door is open, that robot should WAIT to hold it open.
-- If either cabinet door is closed, object actions are forbidden. First restore the closed door by OPENing its handle with the robot already holding that handle.
 - Phase 2: only when both doors are open and held open, PICK mug PLACE mug_coaster and PICK cup PLACE cup_coaster.
-- If Alice is holding a door handle and cup is still inside cabinet, Alice may leave the handle and directly output PICK cup PLACE cup_coaster; this is the required recovery action when Alice is the only valid cup robot.
-- Alice must not leave left_door_handle to PICK mug. In the left-cabinet placement, Chad handles mug and Alice handles cup.
-- Move at most one object among mug/cup per EXECUTE block. Do not PICK mug and cup in the same round.
-- For mug/cup, choose the robot that can currently reach the object's present position and the target coaster; do not assume Chad should always manipulate objects.
-- Respect each agent prompt's reachable objects. If feedback says an object or handle is unreachable, do not repeat the same failed action or same failed EXECUTE block.
-- If Chad fails to reach cup or mug once, Chad must WAIT on the next replan for that object, and another reachable robot must be assigned if one exists. If no reachable robot exists, do not repeat Chad's failed action.
-- If an object manipulation fails or the object is no longer inside the cabinet, re-evaluate from the current Scene description and choose a robot/action valid for the object's current position.
-- If cup or mug is no longer inside the cabinet and is not on its coaster, recovery has priority over holding doors open.
-- If cup has an abnormal position with y >= 1.0 or z <= 0.0, do not assign Chad to PICK cup again; choose Alice if reachable, otherwise do not repeat the failed cup action.
+- Respect each agent prompt's reachable objects. If feedback says an object or handle is unreachable, do not repeat the same failed action.
+- If an object manipulation fails, change the assigned robot or wait with the blocked robot while another valid door/object action progresses.
 - Do not output all WAIT unless both mug and cup are already on their correct coasters.
 """
 CABINET_TASK_CHAT_PROMPT="""Robots discuss to find the best strategy. When each robot talk, it must first reflects on the task status, and its own capability. 
@@ -457,90 +446,25 @@ End your response by either: 1) output PROCEED, if the plans require further dis
                 
     def get_task_feedback(self, llm_plan, pose_dict):
         feedback = ""
-        object_pick_actions = []
-        left_open, right_open = self._door_open_states()
-        obs = self.get_obs()
-        alice_contacts = getattr(obs, self.robot_name_map_inv["Alice"]).contacts
-        bob_contacts = getattr(obs, self.robot_name_map_inv["Bob"]).contacts
         for agent_name, action_str in llm_plan.action_strs.items():
             if 'PICK mug' in action_str or 'PICK cup' in action_str:
                 if 'PLACE' not in action_str:
-                    feedback += f"{agent_name}'s ACTION must contain both PICK and PLACE. "
-                object_pick_actions.append((agent_name, action_str))
-                if not left_open or not right_open:
-                    feedback += "Do not PICK mug or cup while any cabinet door is closed; first OPEN the closed door handle. "
-            for obj in ["mug", "cup"]:
-                if f"PICK {obj}" in action_str:
-                    obj_pos = self.physics.data.body(obj).xpos
-                    coaster_pos = self.coaster_pos[f"{obj}_coaster"]
-                    if np.linalg.norm(obj_pos - coaster_pos) <= self.align_threshold:
-                        feedback += f"{agent_name} must not PICK {obj}; {obj} is already on its coaster. "
+                    feedback += f"{agent_name}'s ACTION must contain both PICK and PLACE"
             if self.cabinet_pos[0] < 0:
                 if 'door_handle' in action_str and agent_name == "Chad":
-                    feedback += f"{agent_name} cannot reach door. "
-                if 'PICK cup' in action_str and agent_name == "Chad":
-                    feedback += "Chad must not PICK cup in this cabinet placement; assign cup to Alice or WAIT. "
-                if 'PICK mug' in action_str and agent_name == "Alice":
-                    feedback += "Alice must not PICK mug in this cabinet placement; assign mug to Chad after both doors are open. "
-                if ('PICK mug' in action_str or 'PICK cup' in action_str) and agent_name == "Bob":
-                    feedback += "Bob cannot reach mug or cup in this cabinet placement. "
+                    feedback += f"{agent_name} cannot reach door"
             else:
                 if 'door_handle' in action_str and agent_name == "Bob":
-                    feedback += f"{agent_name} cannot reach door. "
-                if ('PICK mug' in action_str or 'PICK cup' in action_str) and agent_name == "Chad":
-                    feedback += "Chad cannot reach mug or cup in this cabinet placement. "
-        if len(object_pick_actions) > 1:
-            feedback += "Move at most one object among mug/cup per EXECUTE block; set the other object robot to WAIT. "
-        if not left_open:
-            alice_action = llm_plan.action_strs.get("Alice", "")
-            if "left_door_handle" in alice_contacts:
-                if "OPEN left_door_handle" not in alice_action:
-                    feedback += "Left door is closed and Alice is holding left_door_handle; Alice must OPEN left_door_handle before any object action. "
-            elif "PICK left_door_handle" not in alice_action:
-                feedback += "Left door is closed; Alice must PICK left_door_handle before opening it. "
-        if not right_open:
-            bob_action = llm_plan.action_strs.get("Bob", "")
-            if "right_door_handle" in bob_contacts:
-                if "OPEN right_door_handle" not in bob_action:
-                    feedback += "Right door is closed and Bob is holding right_door_handle; Bob must OPEN right_door_handle before any object action. "
-            elif "PICK right_door_handle" not in bob_action:
-                feedback += "Right door is closed; Bob must PICK right_door_handle before opening it. "
+                    feedback += f"{agent_name} cannot reach door"
         if all(['WAIT' in action_str for action_str in llm_plan.action_strs.values()]):
             feedback += "At least one robot should be acting, you can't all WAIT."
         return feedback 
-
-    def _door_open_states(self):
-        left_qpos_slice = self.physics.named.data.qpos._convert_key("leftdoorhinge")
-        right_qpos_slice = self.physics.named.data.qpos._convert_key("rightdoorhinge")
-        left_qpos = self.physics.data.qpos[left_qpos_slice.start]
-        right_qpos = self.physics.data.qpos[right_qpos_slice.start]
-        return left_qpos <= -2, right_qpos >= 2
 
     def describe_robot_capability(self):
         return ""
 
     def describe_task_context(self):
         context = CABINET_TASK_CONTEXT
-        if self.cabinet_pos[0] < 0:
-            context += """
-Current cabinet-side reachability:
-- Alice can reach left_door_handle, mug, cup.
-- Bob can reach right_door_handle only; Bob must not PICK mug or cup.
-- Chad can reach right_door_handle and mug. In this benchmark, Chad must not PICK cup; assign cup to Alice.
-- If left door is closed and Alice is holding left_door_handle, Alice must OPEN left_door_handle; do not PICK mug or cup until both doors are open.
-- If right door is closed and Bob is holding right_door_handle, Bob must OPEN right_door_handle; do not PICK mug or cup until both doors are open.
-- When both doors are open and mug is not on mug_coaster, assign mug to Chad, not Alice.
-- If cup is inside cabinet and mug is already on its coaster, Alice should PICK cup PLACE cup_coaster even if she is holding left_door_handle. Bob should WAIT to keep right_door_handle open and Chad should WAIT.
-- If Alice is holding left_door_handle or Bob is holding right_door_handle, WAIT is preferred only when no valid object action is needed.
-"""
-        else:
-            context += """
-Current cabinet-side reachability:
-- Alice can reach right_door_handle, mug, cup.
-- Bob can reach left_door_handle, mug, cup.
-- Chad can reach left_door_handle only; Chad must not PICK mug or cup.
-- If Alice is holding right_door_handle or Bob is holding left_door_handle, WAIT is preferred to keep the door open, but Alice or Bob may recover mug or cup when the object is no longer inside the cabinet and the assigned robot failed to reach it.
-"""
         return context
 
     def get_contact(self):

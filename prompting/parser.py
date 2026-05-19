@@ -33,7 +33,6 @@ class LLMResponseParser:
 
     def parse(self, obs: EnvState, response: str) -> Tuple[bool, str, List[LLMPathPlan]]: 
         parsed = ''  
-        response = self._normalize_response(response)
         for keyword in self.response_keywords:
             if keyword not in response: 
                 return False, f"Response does not contain {keyword}." , []
@@ -46,7 +45,7 @@ class LLMResponseParser:
             robot_state = getattr(obs, robot_name)
             robot_states[agent_name] = robot_state 
         
-        execute_str = response.split('EXECUTE')[-1]
+        execute_str = response.split('EXECUTE')[1]
         # find the \n to split the string into line by line
         lines = execute_str.split('\n')
         valid_lines = [
@@ -135,12 +134,6 @@ class LLMResponseParser:
         #     path_plans = splitted_plans
 
         return True, parsed, path_plans
-
-    def _normalize_response(self, response: str) -> str:
-        response = response.replace("```", "").strip()
-        if "EXECUTE" not in response:
-            return response
-        return "EXECUTE" + response.split("EXECUTE")[-1]
     
     def parse_single_line(
         self,
@@ -299,26 +292,10 @@ class LLMResponseParser:
         action_desp: str,
     ): 
         """ Given an object name, assumes the .env has a feasible grasp site"""
+        if len(robot_state.contacts) > 0:
+            return False, f"Robot {agent_name} is already holding an object, can't pick another one.", []
         obj_name = action_desp.split('PICK')[1].strip()
         obj_name = obj_name.split(' ')[0]
-
-        contacts = list(robot_state.contacts)
-        if len(contacts) > 0:
-            cabinet_release_contacts = {
-                "cabinet",
-                "cabinet_body",
-                "left_door_handle",
-                "right_door_handle",
-                "cabinet_leftdoor",
-                "cabinet_rightdoor",
-            }
-            can_release_cabinet_handle = (
-                "Cabinet" in str(self.env)
-                and obj_name in {"mug", "cup"}
-                and all(contact in cabinet_release_contacts for contact in contacts)
-            )
-            if not can_release_cabinet_handle:
-                return False, f"Robot {agent_name} is already holding an object, can't pick another one.", []
         
         if 'Rope' in str(self.env):
             # special case 
@@ -1032,4 +1009,4 @@ NAME Bob ACTION PICK pink_polygon PLACE bin_polygon
 NAME Chad ACTION PICK yellow_trapezoid PLACE bin_trapezoid
         """
     )
-    print(succ, parsed, path_plans)
+    print(succ, parsed, path_plans) 

@@ -387,12 +387,6 @@ Re-format to strictly follow [Action Output Instruction]!
         The blue_square is unidirectionally picked and placed to panel2.
         The pink_polygon is unidirectionally picked and placed to panel4.
         The yellow_trapezoid is unidirectionally picked and placed to panel6.
-5. Recovery exception: if Bob failed or IK failed while moving pink_polygon from panel5 to panel4, output:
-EXECUTE
-NAME Alice ACTION WAIT
-NAME Bob ACTION WAIT
-NAME Chad ACTION PICK pink_polygon PLACE panel5
-Then in the next round Bob should try PICK pink_polygon PLACE panel4.
 Current Phase Objective: {Phase_Goal}
 Environment Feedback: {Last_Step_Status}
 Historical Actions: {Previous_Actions}
@@ -403,7 +397,6 @@ NAME <Robot> ACTION <Action>
 NAME <Robot> ACTION <Action>
 
 Failure to follow format will cause system errors!
-Output raw plain text only. Do not wrap the EXECUTE block in markdown fences or add analysis before it.
 '''
 
         if isinstance(self.env, MakeSandwichTask) and not sw:
@@ -475,13 +468,11 @@ NAME Bob ACTION PUT rope_back_end groove_left_end PATH <path>'
             return """
 [Action Output Instruction]
 必须先输出'EXECUTE', 然后为每robot规划恰好一个ACTION，并确保每个动作单独占一行。
-如果任一柜门是 closed，禁止 PICK mug/cup；必须先让持有该门把手的机器人 OPEN 对应 handle。
 Example: '
 EXECUTE
 NAME Alice ACTION PICK mug PLACE mug_coaster
 NAME Bob ACTION WAIT
 NAME Chad ACTION OPEN left_door_handle'
-只输出纯文本 EXECUTE 块，不要使用 markdown 代码块或额外分析。
 """
 
         return self.env.get_action_prompt()
