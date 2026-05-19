@@ -85,12 +85,14 @@ class SingleThreadPrompter:
         self.round_history = [] # [obs_t, action_t] but only if action_t got executed
         self.failed_plans = [] # could inherit from previous round if the final plan failed to execute in env.
         self.response_history = [] # [response_t]
+        self.last_executed_actions = None
         
 
     def save_state(self, save_path, fname = 'prompter_state.pkl'):
         state_dict = dict(
             round_history=self.round_history,
             failed_plans=self.failed_plans,
+            last_executed_actions=self.last_executed_actions,
         )
         save_path = os.path.join(save_path, fname)
         with open(save_path, "wb") as f:
@@ -102,6 +104,7 @@ class SingleThreadPrompter:
             state_dict = pickle.load(f)
         self.round_history = state_dict["round_history"]
         self.failed_plans = state_dict["failed_plans"]
+        self.last_executed_actions = state_dict.get("last_executed_actions", None)
 
     def compose_round_history(self):
         if len(self.round_history) == 0:
@@ -160,7 +163,25 @@ class SingleThreadPrompter:
             response, usage = self.query_once(
                 system_prompt, user_prompt=""
                 ) # NOTE: single_thread doesn't use user role
-            response_history.append(response)
+            raw_response = response
+            response = self.parser.normalize_response(response)
+            guard_feedback = ""
+            if hasattr(self.env, "correct_action_response"):
+                response, guard_feedback = self.env.correct_action_response(
+                    obs,
+                    response,
+                    previous_actions=self.last_executed_actions,
+                )
+                if guard_feedback:
+                    print(f"[Action guard] {guard_feedback}")
+            if guard_feedback:
+                response_history.append(
+                    f"[Raw LLM Response]\n{raw_response}\n"
+                    f"[Action Guard]\n{guard_feedback}\n"
+                    f"[Corrected Action]\n{response}"
+                )
+            else:
+                response_history.append(response)
             
             timestamp = datetime.now().strftime("%m%d-%H%M")
             tosave = [ 
@@ -174,7 +195,11 @@ class SingleThreadPrompter:
                     },
                     {
                         "sender": "Planner",
-                        "message": response,
+                        "message": response if not guard_feedback else (
+                            f"[Raw LLM Response]\n{raw_response}\n"
+                            f"[Action Guard]\n{guard_feedback}\n"
+                            f"[Corrected Action]\n{response}"
+                        ),
                     },
                     usage,
                 ]
@@ -259,14 +284,27 @@ Re-format to strictly follow [Action Output Instruction]!
 
     
 
+    def _parse_executed_actions(self, parsed_plan: str) -> Dict[str, str]:
+        actions = {}
+        for line in parsed_plan.splitlines():
+            if ":" not in line:
+                continue
+            agent_name, action = line.split(":", 1)
+            actions[agent_name.strip()] = action.strip()
+        return actions
+
     def post_execute_update(self, obs_desp: str, execute_success: bool, parsed_plan: str):
         if execute_success: 
             # clear failed plans, count the previous execute as full past round in history
             self.failed_plans = []
-            responses = "\n".join(self.response_history)
-            self.round_history.append(
-                f"[Response History]\n{responses}\n{obs_desp}\n[Executed Action]\n{parsed_plan}"
-            )
+            self.last_executed_actions = self._parse_executed_actions(parsed_plan)
+            if hasattr(self.env, "summarize_round") and len(obs_desp.strip()) > 0:
+                self.round_history.append(obs_desp.strip() + "\n")
+            else:
+                responses = "\n".join(self.response_history)
+                self.round_history.append(
+                    f"[Response History]\n{responses}\n{obs_desp}\n[Executed Action]\n{parsed_plan}"
+                )
         else:
             self.failed_plans.append(
                 parsed_plan
@@ -278,3 +316,4 @@ Re-format to strictly follow [Action Output Instruction]!
         self.round_history = []
         self.failed_plans = [] 
         self.response_history = []
+        self.last_executed_actions = None
