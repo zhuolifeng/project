@@ -46,6 +46,8 @@ Planning checklist for this task:
 - Keep the target map fixed: blue_square -> panel2, pink_polygon -> panel4, yellow_trapezoid -> panel6.
 - Before choosing an action, verify both the current cube panel and the PLACE panel are reachable by that robot.
 - Use shared handoff panels when needed: Alice/Bob can hand off through panel3; Bob/Chad can hand off through panel5.
+- Every robot action must be valid from the current scene before this EXECUTE block starts. Do not ask a robot to pick a cube that another robot will move later in the same round.
+- A handoff always takes two rounds: first one robot places the cube on the shared panel, then in the next round the receiving robot picks it.
 - Do not output all WAIT unless all three cubes are already on their target panels.
 - If feedback reports reachability, IK, parsing, or execution failure, do not repeat the same failed action; choose a reachable handoff, a reachable target placement, or WAIT only for the blocked robot.
 - In one EXECUTE block, do not assign the same cube to more than one robot.
@@ -69,6 +71,7 @@ SORTING_ACTION_SPACE="""
 2) WAIT
 Only PICK an object if your gripper is empty. Target <location> for PLACE should be panel or a bin.
 Never place a cube on a panel outside that robot's reachable panels. Valid target map is blue_square -> panel2, pink_polygon -> panel4, yellow_trapezoid -> panel6.
+Do not chain dependent handoff actions in one EXECUTE block; the receiver may only PICK after the cube is already on its reachable panel in the current scene.
 [Action Output Instruction]
 You must first output 'EXECUTE\n', then give **exactly** one action per robot, put each on a new line.
 Example: 'EXECUTE\nNAME Alice ACTION PICK red_square PLACE panel3\nNAME Bob ACTION WAIT\nNAME Chad ACTION PICK green_trapezoid PLACE panel6\n'
@@ -562,4 +565,3 @@ if __name__ == "__main__":
     print(env.get_agent_prompt(obs, "Alice"))
     breakpoint()
     img=env.physics.render(camera_id="teaser", height=480, width=600)
-

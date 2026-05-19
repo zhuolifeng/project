@@ -40,6 +40,7 @@ CABINET_ACTION_SPACE="""
 <handle> must be either left or right door handle. Only OPEN a door after you already PICKed its handle, after you OPENed a door, must WAIT at the same spot to hold it open. 
 <object> must be either mug or cup, <location> must be the correct coaster.
 Use only these four action forms. Never invent MOVE, MOVE TO, GO TO, or coordinate-only actions.
+After reachability feedback, never repeat the exact same failed PICK/PLACE action for the same robot and object.
 
 [Action Output Instruction]
 Must first output 'EXECUTE\n', then give **exactly** one action per robot, put each on a new line.
@@ -53,8 +54,10 @@ Each robot does **exactly** one ACTION per round, selected from only one of the 
 Planning checklist for this task:
 - Phase 1: PICK/OPEN both door handles; after a door is open, that robot should WAIT to hold it open.
 - Phase 2: only when both doors are open and held open, PICK mug PLACE mug_coaster and PICK cup PLACE cup_coaster.
-- Respect each agent prompt's reachable objects. If feedback says an object or handle is unreachable, do not repeat the same failed action.
-- If an object manipulation fails, change the assigned robot or wait with the blocked robot while another valid door/object action progresses.
+- For mug/cup, choose the robot that can currently reach the object's present position and the target coaster; do not assume Chad should always manipulate objects.
+- Respect each agent prompt's reachable objects. If feedback says an object or handle is unreachable, do not repeat the same failed action or same failed EXECUTE block.
+- If Chad fails to reach cup or mug once, Chad must WAIT on the next replan for that object, and another reachable robot must be assigned if one exists.
+- If an object manipulation fails or the object is no longer inside the cabinet, re-evaluate from the current Scene description and choose a robot/action valid for the object's current position.
 - Do not output all WAIT unless both mug and cup are already on their correct coasters.
 """
 CABINET_TASK_CHAT_PROMPT="""Robots discuss to find the best strategy. When each robot talk, it must first reflects on the task status, and its own capability. 
