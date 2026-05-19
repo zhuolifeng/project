@@ -172,7 +172,7 @@ class PackGroceryTask(MujocoSimEnv):
     
     @property
     def waypoint_std_threshold(self):
-        return 0.19
+        return 0.3
 
     def get_allowed_collision_pairs(self) -> List[Tuple[int, int]]:
         

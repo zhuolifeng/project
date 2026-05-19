@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 
 from rocobench.envs import SortOneBlockTask, CabinetTask, MoveRopeTask, SweepTask, MakeSandwichTask, PackGroceryTask, MujocoSimEnv, SimRobot, visualize_voxel_scene
 from rocobench import PlannedPathPolicy, LLMPathPlan, MultiArmRRT
-from prompting import LLMResponseParser, FeedbackManager, DialogPrompter, SingleThreadPrompter, StepPrompter, save_episode_html
+from prompting import LLMResponseParser, FeedbackManager, DialogPrompter, SingleThreadPrompter, save_episode_html
 
 # print out logging.info
 logging.basicConfig(level=logging.INFO)
@@ -120,14 +120,13 @@ class LLMRunner:
             step_std_threshold=self.env.waypoint_std_threshold,
             max_failed_waypoints=self.max_failed_waypoints,
         )
-        if llm_comm_mode in ["plan", "chat", "step"]:
+        if llm_comm_mode in ["plan", "chat"]:
             logging.warning(f'Using SingleThreadPrompter for {llm_comm_mode} mode')
-            prompter_cls = StepPrompter if llm_comm_mode == "step" else SingleThreadPrompter
-            self.prompter = prompter_cls(
+            self.prompter = SingleThreadPrompter(
                 env=self.env,
                 parser=self.parser,
                 feedback_manager=self.feedback_manager,
-                max_tokens=65536,
+                max_tokens=1024,
                 debug_mode=self.debug_mode,
                 use_waypoints=(self.llm_output_mode == "action_and_path"),
                 use_history=self.use_history,
@@ -142,7 +141,7 @@ class LLMRunner:
                 env=self.env,
                 parser=self.parser,
                 feedback_manager=self.feedback_manager,
-                max_tokens=65536,
+                max_tokens=512,
                 debug_mode=self.debug_mode,
                 robot_name_map=self.env.robot_name_map,
                 max_calls_per_round=10,
@@ -205,6 +204,7 @@ class LLMRunner:
             prompt_path = os.path.join(step_dir, "prompts")
             os.makedirs(prompt_path, exist_ok=self.overwrite)
 
+            obs_before_step = deepcopy(obs)
             sim_data = env.save_intermediate_state()
             data_fname = f"{step_dir}/env_init.pkl"
             with open(data_fname, "wb") as f:
@@ -309,8 +309,19 @@ class LLMRunner:
             with open(data_fname, "wb") as f:
                 pickle.dump(sim_data, f)
 
+            history_desp = ""
+            if (not rewind_env) and hasattr(env, "summarize_round"):
+                try:
+                    history_desp = env.summarize_round(
+                        obs_before=obs_before_step,
+                        obs_after=obs,
+                        parsed_plan=current_llm_plan[0].get_action_desp(),
+                    )
+                except Exception as exc:
+                    print(f"Warning: failed to summarize round history: {exc}")
+
             self.prompter.post_execute_update(
-                obs_desp=obs,
+                obs_desp=history_desp,
                 execute_success=(not rewind_env),
                 parsed_plan=current_llm_plan[0].get_action_desp()
             )
@@ -415,9 +426,6 @@ def main(args):
         args.control_freq = 20
         args.max_failed_waypoints = 0
         logging.warning("MopeRope requires max failed waypoints 0\n")
-        if not args.no_feedback:
-            args.tstep = 5
-            logging.warning("MoveRope needs only 5 tsteps\n")
 
     elif args.task == 'pack':
         args.output_mode = 'action_and_path'
@@ -468,7 +476,7 @@ def main(args):
         overwrite=True,
         skip_display=args.skip_display,
         llm_output_mode=args.output_mode, # "action_only" or "action_and_path"
-        llm_comm_mode=args.comm_mode, # "chat", "plan", or "step"
+        llm_comm_mode=args.comm_mode, # "chat" or "plan"
         llm_num_replans=args.num_replans,
         policy_kwargs=dict(
             control_freq=args.control_freq,
@@ -499,7 +507,7 @@ if __name__ == "__main__":
     parser.add_argument("--tsteps", "-t", type=int, default=10)
     parser.add_argument("--task", type=str, default="cabinet")
     parser.add_argument("--output_mode", type=str, default="action_only", choices=["action_only", "action_and_path"])
-    parser.add_argument("--comm_mode", type=str, default="chat", choices=["chat", "plan", "dialog", "step"])
+    parser.add_argument("--comm_mode", type=str, default="chat", choices=["chat", "plan", "dialog"])
     parser.add_argument("--control_freq", "-cf", type=int, default=15)
     parser.add_argument("--skip_display", "-sd", action="store_true")
     parser.add_argument("--direct_waypoints", "-dw", type=int, default=5)
@@ -514,7 +522,7 @@ if __name__ == "__main__":
     parser.add_argument("--split_parsed_plans", "-sp", action="store_true")
     parser.add_argument("--no_history", "-nh", action="store_true")
     parser.add_argument("--no_feedback", "-nf", action="store_true")
-    parser.add_argument("--llm_source", "-llm", type=str, default=os.environ.get("ROCOBENCH_LLM_SOURCE", "qwen3:8b")) # You can choose one model here.
+    parser.add_argument("--llm_source", "-llm", type=str, default="qwen3:32b") # You can choose one model here.
     parser.add_argument("--seed", "-seed", type=int, default=0)
     parser.add_argument("--run_timeout", "-rt", type=float, default=600, help="Timeout for each run in seconds (default: 600s = 10min)")
     logging.basicConfig(level=logging.INFO)

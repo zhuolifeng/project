@@ -11,6 +11,7 @@ from datetime import datetime
 from .feedback import FeedbackManager
 from .parser import LLMResponseParser
 from .ollama_client import query_ollama_chat
+from .task_hints import build_task_hint
 from typing import List, Tuple, Dict, Union, Optional, Any
 
 PATH_PLAN_INSTRUCTION="""
@@ -29,21 +30,27 @@ Each <coord> is a tuple (x,y,z) for gripper location, follow these steps to plan
     If a plan failed to execute, re-plan to choose more feasible steps in each PATH, or choose different actions.
 """
 
-SYSTEM_PROMPT = "你是一个规划专家，你需要根据我的指令，规划机器人的动作。务必保证机器人的动作是合理且优化的，且如果需要路径规划，注意避免路径之间的碰撞和路径与物体的碰撞，保证路径不发生交叉，同时尽量**均匀地**规划路径，计算相邻路径间的距离，并保证均匀。因为每次交互只能对一个回合进行操作，所以每次只思考一个回合的规划。**不要过度思考**。**输出的结果必须严格符合[Output Instruction]中的要求输出。**"
-
 SWEEP_TASK_PROMPT = """Alice（dustpan）和 Bob（broom）需协作清扫桌面上的所有方块。清扫规则：Alice 需将 dustpan 置于方块一侧，Bob 从对侧将方块 sweep 进簸箕。每轮任务需根据 “Scene description” 和 “Environment feedback” 迭代优化计划。请检查“History”中的内容，机器人当前位于上一次 MOVE 到的物体边缘，只有当两者处于同一物品边缘时才能进行 SWEEP 操作。当两者都到同一个物体旁边时，应该先进行 SWEEP 操作，在 SWEEP 操作后再思考下一步的 MOVE，只需要在最后进行一次 DUMP。本任务不需要路径规划！"""
 
 
 
 def get_chat_prompt(env: MujocoSimEnv):
-    return """请逐步对该任务进行分析推理，找出协调各机器人的最佳策略。为每台机器人精准规划恰好一个动作，并形成具体计划。
-借助 [Environment Feedback] 信息来完善你的计划。严格遵循[Output Instruction]中的要求输出。"""
+    robot_names = env.get_sim_robots().keys()
+    talk_order_str = ",".join([f"[{name}]" for name in robot_names])
+    chat_prompt = f"""
+The robots discuss to find the best strategy. They carefully analyze others' responses and use [Environment Feedback] to improve their plan. 
+They talk in order {talk_order_str}... Once they reach agreement, they summarize the plan by **strictly** following [Action Output Instruction] to format the output, then stop talking.
+Their entire discussion and final plan are:
+    """
+    return chat_prompt 
 
 
 def get_plan_prompt(env: MujocoSimEnv):
-    return """请逐步对该任务进行分析推理，找出协调各机器人的最佳策略。为每台机器人精准规划恰好一个动作，并形成具体计划。
-借助 [Environment Feedback] 信息来完善你的计划。严格遵循[Output Instruction]中的要求输出。
-请给出你的推理过程和最终计划：\n"""
+    return """
+Reason about the task step-by-step, and find the best strategy to coordinate the robots. Propose a plan of **exactly** one action per robot.
+Use [Environment Feedback] to improve your plan. Strictly follow [Action Output Instruction] to format and output the plan.
+Your reasoning and final plan output are:
+    """
     
 
 class SingleThreadPrompter:
@@ -63,7 +70,7 @@ class SingleThreadPrompter:
         num_replans: int = 3,
         debug_mode: bool = False,   
         temperature: float = 0,
-        max_tokens: int = 65536, 
+        max_tokens: int = 1000, 
         llm_source: str = "gpt-4",
     ):
         self.env = env 
@@ -81,17 +88,16 @@ class SingleThreadPrompter:
         self.max_tokens = max_tokens
 
         self.round_history = [] # [obs_t, action_t] but only if action_t got executed
-        self.round_history_brief = []
         self.failed_plans = [] # could inherit from previous round if the final plan failed to execute in env.
         self.response_history = [] # [response_t]
-        self.old_obs_desp = None
+        self.last_executed_actions = None
         
 
     def save_state(self, save_path, fname = 'prompter_state.pkl'):
         state_dict = dict(
             round_history=self.round_history,
-            round_history_brief=self.round_history_brief,
             failed_plans=self.failed_plans,
+            last_executed_actions=self.last_executed_actions,
         )
         save_path = os.path.join(save_path, fname)
         with open(save_path, "wb") as f:
@@ -102,49 +108,25 @@ class SingleThreadPrompter:
         with open(load_path, "rb") as f:
             state_dict = pickle.load(f)
         self.round_history = state_dict["round_history"]
-        self.round_history_brief = state_dict.get("round_history_brief", [])
         self.failed_plans = state_dict["failed_plans"]
+        self.last_executed_actions = state_dict.get("last_executed_actions", None)
 
     def compose_round_history(self):
         if len(self.round_history) == 0:
             return ""
         ret = "[History]\n"
-        pattern = r"\[Executed Action\]([\s\S]*)"
         for i, history in enumerate(self.round_history):
-            match = re.search(pattern, history)
-            history_f = match.group(1).strip() if match else history
-            ret += f"== Round#{i} ==\n{history_f}\n"
-        ret += "== Current Round ==\n"
-        return ret
-
-    def compose_round_history_brief(self):
-        if len(self.round_history_brief) == 0:
-            return ""
-        ret = "[History]\n"
-        for i, history in enumerate(self.round_history_brief):
-            ret += f"== Round#{i} ==\n{history}\n"
+            ret += f"== Round#{i} ==\n{history}"
         ret += f"== Current Round ==\n"
         return ret
-
-    def describe_robot_state(self, obs, agent_name):
-        robot_name = self.env.robot_name_map_inv.get(agent_name, None)
-        assert robot_name is not None, f"Agent {agent_name} is not found in the task env!"
-        robot_state = getattr(obs, robot_name)
-        x, y, z = robot_state.ee_xpos
-        if agent_name == "Alice" or robot_name == "ur5e_robotiq":
-            obj = "dustpan"
-        else:
-            obj = "broom"
-        return f"{agent_name}'s gripper is at ({x:.1f}, {y:.1f}, {z:.1f}), holding {obj}"
         
     def compose_system_prompt(
         self,
         obs_desp: str,
         plan_feedbacks: List[str] = [], 
+        obs: EnvState = None,
         ):
         
-        self.old_obs_desp = obs_desp
-
         task_desp = self.env.describe_task_context() # should include task rules
         if isinstance(self.env, SweepTask):
             task_desp = SWEEP_TASK_PROMPT
@@ -161,28 +143,24 @@ class SingleThreadPrompter:
         full_prompt = f"{task_desp}\n{action_desp}\n" 
         
         if self.use_history:
-            history_desp = self.compose_round_history_brief() 
-            if isinstance(self.env, MakeSandwichTask):
-                history_desp = self.compose_round_history()
+            history_desp = self.compose_round_history() 
             full_prompt += history_desp + "\n" 
-
-        if isinstance(self.env, SweepTask):
-            object_desp = "[Scene description]\n"
-            for name in self.env.cube_names:
-                object_desp += self.env.describe_cube_state(self.env.get_obs(), name) + "\n"
-            robot_desp = ""
-            for robot_name, agent_name in self.env.robot_name_map.items():
-                robot_desp += self.describe_robot_state(self.env.get_obs(), agent_name=agent_name) + "\n"
-            obs_desp = object_desp + robot_desp
+        
         full_prompt += obs_desp + "\n"
 
+        if obs is not None:
+            task_hint = build_task_hint(self.env, obs)
+            if task_hint:
+                full_prompt += task_hint + "\n"
+
         if len(self.failed_plans) > 0:
-            execute_feedback = "以下计划执行失败，请对其进行优化以避免碰撞并平稳抵达目标：\n"
+            execute_feedback = "Plans below failed to execute, improve them to avoid collision and smoothly reach the targets:\n"
             execute_feedback += "\n".join(self.failed_plans) 
+            execute_feedback += "\n[Hard Rule] Do NOT re-emit any of the failed plans above. If reachability/collision/constraint failed, change the action, waypoint route, or robot assignment.\n"
             full_prompt += execute_feedback + "\n"
 
         if len(plan_feedbacks) > 0:
-            feedback_prompt = "先前的计划是不可行的，思考原因并避免:\n"
+            feedback_prompt = "Previous Plans Require Improvement:\n"
             feedback_prompt += "\n".join(plan_feedbacks) + "\n"
             full_prompt += feedback_prompt
         
@@ -194,6 +172,11 @@ class SingleThreadPrompter:
             raise NotImplementedError
         full_prompt += self.get_action_output_instruction(isinstance(self.env, MakeSandwichTask))
         full_prompt += comm_prompt
+        full_prompt += (
+            "\n[Think-then-Execute]\n"
+            "Before the EXECUTE block, briefly reason about which object/action is valid for each robot. "
+            "Then output exactly one EXECUTE block as specified above.\n"
+        )
 
         return full_prompt 
 
@@ -202,25 +185,47 @@ class SingleThreadPrompter:
         response_history = []
         obs_desp = self.env.describe_obs(obs)
         for i in range(self.num_replans): 
-            system_prompt = self.compose_system_prompt(obs_desp, plan_feedbacks)
+            system_prompt = self.compose_system_prompt(obs_desp, plan_feedbacks, obs=obs)
             response, usage = self.query_once(
                 system_prompt, user_prompt=""
                 ) # NOTE: single_thread doesn't use user role
-            response_history.append(response)
+            raw_response = response
+            response = self.parser.normalize_response(response)
+            guard_feedback = ""
+            if hasattr(self.env, "correct_action_response"):
+                response, guard_feedback = self.env.correct_action_response(
+                    obs,
+                    response,
+                    previous_actions=self.last_executed_actions,
+                )
+                if guard_feedback:
+                    print(f"[Action guard] {guard_feedback}")
+            if guard_feedback:
+                response_history.append(
+                    f"[Raw LLM Response]\n{raw_response}\n"
+                    f"[Action Guard]\n{guard_feedback}\n"
+                    f"[Corrected Action]\n{response}"
+                )
+            else:
+                response_history.append(response)
             
             timestamp = datetime.now().strftime("%m%d-%H%M")
             tosave = [ 
                     {
                         "sender": "SystemPrompt",
-                        "message": SYSTEM_PROMPT,
-                    },
-                    {
-                        "sender": "UserPrompt",
                         "message": system_prompt,
                     },
                     {
+                        "sender": "UserPrompt",
+                        "message": "",
+                    },
+                    {
                         "sender": "Planner",
-                        "message": response,
+                        "message": response if not guard_feedback else (
+                            f"[Raw LLM Response]\n{raw_response}\n"
+                            f"[Action Guard]\n{guard_feedback}\n"
+                            f"[Corrected Action]\n{response}"
+                        ),
                     },
                     usage,
                 ]
@@ -289,15 +294,14 @@ Re-format to strictly follow [Action Output Instruction]!
             try:
                 response, usage = query_ollama_chat(
                     model=self.llm_source,
-                    system_prompt=SYSTEM_PROMPT,
-                    user_prompt=system_prompt + user_prompt,
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
                     temperature=self.temperature,
-                    max_tokens=65536,
+                    max_tokens=self.max_tokens,
                 )
 
                 print('======= response ======= \n ', response)
                 print('======= usage ======= \n ', usage)
-                response = self.response_formatter(response)
                 break
             except Exception as exc:
                 print(f"API error, try again: {exc}")
@@ -309,76 +313,29 @@ Re-format to strictly follow [Action Output Instruction]!
             )
         return response, usage
 
-    def response_formatter(self, response):
-        format_prompt = (
-            f"我要求的格式为：<format>{self.get_action_output_instruction(isinstance(self.env, MakeSandwichTask))}</format>\n。"
-            f"根据下面的内容，提供符合上面格式的输出：<content>{response}</content>。"
-            "将你的回答用<formatted></formatted>包裹。"
-        )
-        formatted_response, _ = query_ollama_chat(
-            model=self.llm_source,
-            system_prompt="你是一个专业的信息格式化助手，我需要你根据我提供的format，格式化我提供的content",
-            user_prompt=format_prompt,
-            temperature=0,
-            max_tokens=65536,
-        )
-        print("====== formatted ======\n", formatted_response)
-        if "<formatted>" in formatted_response and "</formatted>" in formatted_response:
-            return formatted_response.split("<formatted>")[-1].split("</formatted>")[0]
-        return formatted_response
-
     
 
-    def _describe_obs_for_summary(self, obs_desp) -> str:
-        if isinstance(obs_desp, str):
-            return obs_desp
-        try:
-            return self.env.describe_obs(obs_desp)
-        except Exception:
-            return ""
-
-    def _extract_summary(self, summary_response: str) -> str:
-        match = re.search(r"<summary>(.*?)</summary>", summary_response, re.DOTALL)
-        if match:
-            return match.group(1).strip()
-        return summary_response.strip()
-
-    def _summarize_round(self, obs_desp, parsed_plan: str) -> str:
-        after_obs = self._describe_obs_for_summary(obs_desp).replace("[Scene description]", "")
-        before_obs = (self.old_obs_desp or "").replace("[Scene description]", "")
-        responses = "\n".join(self.response_history)
-        summarize_prompt = "<Task Information>"
-        summarize_prompt += f"The task descriptions are as follows:\n<Task Description>{self.env.describe_task_context()}</Task Description>\n\n"
-        summarize_prompt += f"The action descriptions are as follows:\n<Action Description>{self.env.get_action_prompt()}</Action Description>\n\n"
-        summarize_prompt += f"The LLM response is as follows:\n<LLM Response>{responses}</LLM Response>\n\n"
-        summarize_prompt += f"The parsed action is as follows:\n<parsed_plan>{parsed_plan}</parsed_plan>\n\n"
-        if before_obs:
-            summarize_prompt += f"The environment information before executing the action is as follows:\n<Environment Observation>{before_obs}</Environment Observation>\n\n"
-        if after_obs:
-            summarize_prompt += f"The environment information after executing the action is as follows:\n<Environment Observation>{after_obs}</Environment Observation>\n\n"
-        summarize_prompt += "</Task Information>\nSummarize what the LLM planned, what action was executed, and what changed in the environment. Your response must contain exactly one concise sentence wrapped in <summary></summary>."
-        response, _ = query_ollama_chat(
-            model=self.llm_source,
-            system_prompt="You summarize robot-task execution history for future planning prompts.",
-            user_prompt=summarize_prompt,
-            temperature=0,
-            max_tokens=min(self.max_tokens, 512),
-        )
-        return self._extract_summary(response)
+    def _parse_executed_actions(self, parsed_plan: str) -> Dict[str, str]:
+        actions = {}
+        for line in parsed_plan.splitlines():
+            if ":" not in line:
+                continue
+            agent_name, action = line.split(":", 1)
+            actions[agent_name.strip()] = action.strip()
+        return actions
 
     def post_execute_update(self, obs_desp: str, execute_success: bool, parsed_plan: str):
         if execute_success: 
             # clear failed plans, count the previous execute as full past round in history
             self.failed_plans = []
-            responses = "\n".join(self.response_history)
-            self.round_history.append(
-                f"[Response History]\n{responses}\n{obs_desp}\n[Executed Action]\n{parsed_plan}"
-            )
-            try:
-                self.round_history_brief.append(self._summarize_round(obs_desp, parsed_plan))
-            except Exception as exc:
-                print(f"Summary generation failed, falling back to compact action history: {exc}")
-                self.round_history_brief.append(parsed_plan)
+            self.last_executed_actions = self._parse_executed_actions(parsed_plan)
+            if hasattr(self.env, "summarize_round") and len(obs_desp.strip()) > 0:
+                self.round_history.append(obs_desp.strip() + "\n")
+            else:
+                responses = "\n".join(self.response_history)
+                self.round_history.append(
+                    f"[Response History]\n{responses}\n{obs_desp}\n[Executed Action]\n{parsed_plan}"
+                )
         else:
             self.failed_plans.append(
                 parsed_plan
@@ -388,9 +345,9 @@ Re-format to strictly follow [Action Output Instruction]!
     def post_episode_update(self):
         # clear for next episode
         self.round_history = []
-        self.round_history_brief = []
         self.failed_plans = [] 
         self.response_history = []
+        self.last_executed_actions = None
 
     def get_action_output_instruction(self, sw=False):
         if isinstance(self.env, SortOneBlockTask):
@@ -405,7 +362,7 @@ Re-format to strictly follow [Action Output Instruction]!
         Chad can place {panel5,panel6,panel7} and can not place {panel1,panel2,panel3,panel4};
         The blue_square is unidirectionally picked and placed to panel2.
         The pink_polygon is unidirectionally picked and placed to panel4.
-        The pink_polygon is unidirectionally picked and placed to panel6.
+        The yellow_trapezoid is unidirectionally picked and placed to panel6.
 Current Phase Objective: {Phase_Goal}
 Environment Feedback: {Last_Step_Status}
 Historical Actions: {Previous_Actions}
@@ -422,7 +379,7 @@ Failure to follow format will cause system errors!
             return '''
 [Output Instruction]
 ## Mission Objective
-Generate 3 candidate action blocks per control cycle, then select **exactly one valid EXECUTE block** adhering to safety protocols.
+Generate candidate action blocks per control cycle, then select **exactly one valid EXECUTE block** adhering to safety protocols.
 
 ## Standard Output
 The final EXECUTE action block is:
@@ -479,8 +436,8 @@ NAME Bob ACTION PICK bread PATH [(0.35, 1.05, 0.62), (0.15, 0.81, 0.59), (-0.01,
 必须先输出'EXECUTE', 然后为每robot规划恰好一个ACTION，并确保每个动作单独占一行。
 Example: '
 EXECUTE
-NAME Alice ACTION PUT rope_front_end groove_right_end PATH <path>
-NAME Bob ACTION PUT rope_back_end groove_left_end PATH <path>'
+NAME Alice ACTION PUT rope_front_end groove_left_end PATH <path>
+NAME Bob ACTION PUT rope_back_end groove_right_end PATH <path>'
 """
 
         if isinstance(self.env, CabinetTask):

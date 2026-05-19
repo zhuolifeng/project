@@ -4,6 +4,7 @@ import sys
 from glob import glob
 import json
 import time
+import argparse
 from datetime import datetime
 from utils import Colors, log_subprocess_result, next_task_log_dir, relpath, terminal_log, to_text, write_run_summary, write_task_summary
 
@@ -17,12 +18,20 @@ DEFAULT_RUN_TIMEOUTS = {
     "pack": 600,
 }
 
+DEFAULT_LLM_SOURCE = os.environ.get("ROCOBENCH_LLM_SOURCE", "qwen3:32b")
+DEFAULT_COMM_MODE = os.environ.get("ROCOBENCH_COMM_MODE", "chat")
+DEFAULT_TSTEPS = int(os.environ.get("ROCOBENCH_TSTEPS", "10"))
+
+
 def test_run_dialog(
     task: str,
     num_runs: int,
     output_dir: str,
     seed: int = 0,
     run_timeout: float = None,
+    llm_source: str = DEFAULT_LLM_SOURCE,
+    comm_mode: str = DEFAULT_COMM_MODE,
+    tsteps: int = DEFAULT_TSTEPS,
 ):
     """
     Test and run dialog tasks
@@ -33,6 +42,9 @@ def test_run_dialog(
         output_dir: Output directory
         seed: Random seed
         run_timeout: Timeout for single run (seconds). If None, use value from DEFAULT_RUN_TIMEOUTS, default 60s
+        llm_source: Ollama model name passed to run_dialog.py --llm_source
+        comm_mode: Prompting mode passed to run_dialog.py --comm_mode
+        tsteps: Maximum runner steps passed to run_dialog.py --tsteps
     """
     # If timeout not specified, use task default or global default of 60s
     if run_timeout is None:
@@ -40,6 +52,7 @@ def test_run_dialog(
     
     print("\n" + Colors.CYAN + Colors.BOLD + f"▶ Starting Task: {task.upper()}" + Colors.ENDC)
     print(Colors.CYAN + f"  Configuration: {num_runs} runs, {run_timeout}s timeout per run" + Colors.ENDC)
+    print(Colors.CYAN + f"  LLM: {llm_source}, comm_mode: {comm_mode}, tsteps: {tsteps}" + Colors.ENDC)
     
     task_log_dir = next_task_log_dir(task)
     if task_log_dir is not None:
@@ -73,9 +86,11 @@ def test_run_dialog(
                '--start_id', str(-1),
                '--num_runs', str(num_runs),
                '--skip_display',
-               '--tsteps', str(10),
+               '--tsteps', str(tsteps),
                '--seed', str(seed),
-               '--run_timeout', str(run_timeout)]  # Pass run timeout parameter
+               '--run_timeout', str(run_timeout),
+               '--llm_source', llm_source,
+               '--comm_mode', comm_mode]  # Pass run timeout parameter
 
     subprocess_started_at = datetime.now()
     try:
@@ -195,6 +210,9 @@ def test_run_dialog(
         'total_time': total_time,
         'returncode': result.returncode,
         'run_ids': current_run_ids,
+        'llm_source': llm_source,
+        'comm_mode': comm_mode,
+        'tsteps': tsteps,
     }
     if task_log_dir is not None:
         summary['log_dir'] = relpath(task_log_dir)
@@ -206,9 +224,31 @@ def test_run_dialog(
 
     return summary
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Batch evaluator for RocoBench tasks.")
+    parser.add_argument("--llm_source", "-llm", default=DEFAULT_LLM_SOURCE,
+                        help="Ollama model name passed to run_dialog.py. Defaults to ROCOBENCH_LLM_SOURCE or qwen3:32b.")
+    parser.add_argument("--comm_mode", "-cm", default=DEFAULT_COMM_MODE,
+                        choices=["chat", "plan", "dialog"],
+                        help="Prompting mode passed to run_dialog.py. Defaults to ROCOBENCH_COMM_MODE or chat.")
+    parser.add_argument("--num_runs", "-n", type=int, default=5,
+                        help="Number of runs per task.")
+    parser.add_argument("--tsteps", "-t", type=int, default=DEFAULT_TSTEPS,
+                        help="Maximum steps per run.")
+    parser.add_argument("--seed", type=int, default=0,
+                        help="Random seed passed to run_dialog.py.")
+    parser.add_argument("--output_dir", "-o", default="output",
+                        help="Fallback output directory if terminal_log is not active.")
+    parser.add_argument("--tasks", nargs="+",
+                        default=["sort", "cabinet", "rope", "sweep", "sandwich", "pack"],
+                        choices=["sort", "cabinet", "rope", "sweep", "sandwich", "pack"],
+                        help="Tasks to evaluate.")
+    return parser.parse_args()
+
 
 if __name__ == "__main__":
     import time as time_module
+    args = parse_args()
 
     with terminal_log():
         # tasks = ["sort", "cabinet", "rope", "sweep", "sandwich", "pack"]
@@ -218,12 +258,16 @@ if __name__ == "__main__":
         results = []
 
         # Use default timeout (from DEFAULT_RUN_TIMEOUTS)
-        results.append(test_run_dialog("sort", 5, "output"))
-        results.append(test_run_dialog("cabinet", 5, "output"))
-        results.append(test_run_dialog("rope", 5, "output"))
-        results.append(test_run_dialog("sweep", 5, "output"))
-        results.append(test_run_dialog("sandwich", 5, "output"))
-        results.append(test_run_dialog("pack", 5, "output"))
+        for task in args.tasks:
+            results.append(test_run_dialog(
+                task,
+                args.num_runs,
+                args.output_dir,
+                seed=args.seed,
+                llm_source=args.llm_source,
+                comm_mode=args.comm_mode,
+                tsteps=args.tsteps,
+            ))
 
         end_time = time_module.time()
         total_elapsed = end_time - begin_time

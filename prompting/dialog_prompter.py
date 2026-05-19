@@ -15,7 +15,8 @@ from rocobench.envs import MujocoSimEnv, EnvState
 from .feedback import FeedbackManager
 from .parser import LLMResponseParser
 from .ollama_client import query_ollama_chat
-from .context_compactor import compact_items, compact_text
+from .text_utils import strip_think
+from .task_hints import build_task_hint
 
 
 PATH_PLAN_INSTRUCTION="""
@@ -36,6 +37,23 @@ Each <coord> is a tuple (x,y,z) for gripper location, follow these steps to plan
 
 SWEEP_TASK_PROMPT = """Alice（dustpan）和 Bob（broom）需协作清扫桌面上的所有方块。清扫规则：Alice 需将 dustpan 置于方块一侧，Bob 从对侧将方块 sweep 进簸箕。每轮任务需根据 “Scene description” 和 “Environment feedback” 迭代优化计划。每个机器人每轮严格只执行一个动作，因此只需要输出一组动作。请检查“History”中的内容，机器人当前位于上一次 MOVE 到的物体边缘，只有当两者处于同一物品边缘时才能进行 SWEEP 操作。只需要在最后进行一次 DUMP。"""
 
+MAX_PARSE_FAILS_PER_ROUND = 3
+
+
+def compact_text(text: str, max_chars: int = 4000) -> str:
+    text = strip_think(text or "")
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = text.strip()
+    if max_chars and len(text) > max_chars:
+        return text[:max_chars].rstrip() + "\n...[truncated]"
+    return text
+
+
+def compact_items(items: List[str], max_chars: int = 4000) -> List[str]:
+    return [compact_text(item, max_chars=max_chars) for item in items]
+
+
 class DialogPrompter:
     """
     Each round contains multiple prompts, query LLM once per each agent 
@@ -45,7 +63,7 @@ class DialogPrompter:
         env: MujocoSimEnv,
         parser: LLMResponseParser,
         feedback_manager: FeedbackManager, 
-        max_tokens: int = 65536, 
+        max_tokens: int = 2048, 
         debug_mode: bool = False,
         use_waypoints: bool = False,
         robot_name_map: Dict[str, str] = {"panda": "Bob"},
@@ -109,6 +127,10 @@ class DialogPrompter:
         
         if len(current_chat) > 0:
             system_prompt += "[Current Chat]\n" + "\n".join(compact_items(current_chat)) + "\n"
+
+        task_hint = build_task_hint(self.env, obs)
+        if task_hint:
+            system_prompt += "\n" + task_hint + "\n"
 
         return system_prompt 
 
@@ -197,6 +219,7 @@ This previous response from [{final_agent}] failed to parse!: '{final_response}'
         dialog_done = False 
         num_responses = {agent_name: 0 for agent_name in self.robot_agent_names}
         n_calls = 0
+        parse_fail_streak = 0
 
         while n_calls < self.max_calls_per_round:
             for agent_name in self.robot_agent_names:
@@ -240,16 +263,21 @@ Your response is:
                 json.dump(tosave, open(fname, 'w'))  
 
                 num_responses[agent_name] += 1
-                # strip all the repeated \n and blank spaces in response: 
                 pruned_response = compact_text(response)
-                # pruned_response = pruned_response.replace("\n", " ")
                 agent_responses.append(
                     f"[{agent_name}]:\n{pruned_response}"
                     )
                 usages.append(usage)
                 n_calls += 1
                 if 'EXECUTE' in response:
+                    parse_fail_streak = 0
                     if replan_idx > 0 or all([v > 0 for v in num_responses.values()]):
+                        dialog_done = True
+                        break
+                else:
+                    parse_fail_streak += 1
+                    if parse_fail_streak >= MAX_PARSE_FAILS_PER_ROUND:
+                        print(f"[dialog] {parse_fail_streak} consecutive no-EXECUTE responses; breaking to outer replan loop")
                         dialog_done = True
                         break
  
@@ -286,7 +314,7 @@ Your response is:
                     system_prompt=system_prompt,
                     user_prompt=user_prompt,
                     temperature=self.temperature,
-                    max_tokens=65536,
+                    max_tokens=self.max_tokens,
                 )
 
                 print('======= response ======= \n ', response)
@@ -301,7 +329,6 @@ Your response is:
                 f"Failed to query Ollama model {self.llm_source!r} "
                 f"after {max_query} attempts"
             )
-        # breakpoint()
         return response, usage
     
     def _describe_obs_for_summary(self, obs_desp) -> str:

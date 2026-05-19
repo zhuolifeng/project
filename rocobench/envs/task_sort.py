@@ -42,6 +42,20 @@ There are 3 robots, each with a limited reach range, this means they can only pi
 (Alice, [panel1, panel2, panel3])
 (Bob, [panel3, panel4, panel5])
 (Chad, [panel5, panel6, panel7])
+Planning checklist for this task:
+- Keep the target map fixed: blue_square -> panel2, pink_polygon -> panel4, yellow_trapezoid -> panel6.
+- Before choosing an action, verify both the current cube panel and the PLACE panel are reachable by that robot.
+- Use shared handoff panels when needed: Alice/Bob can hand off through panel3; Bob/Chad can hand off through panel5.
+- Valid final placements are only: Alice places blue_square on panel2; Bob places pink_polygon on panel4; Chad places yellow_trapezoid on panel6.
+- Valid handoff placements are only: blue_square or pink_polygon to panel3, yellow_trapezoid to panel5.
+- Alice must never PLACE pink_polygon on panel4. Bob must never PLACE blue_square on panel2 or yellow_trapezoid on panel6. Chad must never PLACE pink_polygon on panel4 or blue_square on panel2.
+- Never move a cube that is already on its target panel. Never place a cube back on its current panel.
+- Every robot action must be valid from the current scene before this EXECUTE block starts. Do not ask a robot to pick a cube that another robot will move later in the same round.
+- A handoff always takes two rounds: first one robot places the cube on the shared panel, then in the next round the receiving robot picks it.
+- Do not output all WAIT unless all three cubes are already on their target panels.
+- If feedback reports reachability, IK, parsing, or execution failure, do not repeat the same failed action; choose a reachable handoff, a reachable target placement, or WAIT only for the blocked robot.
+- In one EXECUTE block, output exactly one line for Alice, one line for Bob, and one line for Chad; do not repeat or omit any robot.
+- In one EXECUTE block, do not assign the same cube to more than one robot. If two useful actions would use the same pickup area, choose one and set the other robot to WAIT.
 """
  
 SORT_TASK_DIALOG_PROMPT=""
@@ -61,9 +75,14 @@ SORTING_ACTION_SPACE="""
 1) PICK <object name> PLACE <location>
 2) WAIT
 Only PICK an object if your gripper is empty. Target <location> for PLACE should be panel or a bin.
+PLACE without PICK is invalid. Always write object movement exactly as: PICK <object name> PLACE <panel>.
+Never place a cube on a panel outside that robot's reachable panels. Valid target map is blue_square -> panel2, pink_polygon -> panel4, yellow_trapezoid -> panel6.
+Never use PICK <object> PLACE <same current panel>; it is a no-op and invalid.
+Do not chain dependent handoff actions in one EXECUTE block; the receiver may only PICK after the cube is already on its reachable panel in the current scene.
 [Action Output Instruction]
 You must first output 'EXECUTE\n', then give **exactly** one action per robot, put each on a new line.
-Example: 'EXECUTE\nNAME Alice ACTION PICK red_square PLACE panel3\nNAME Bob ACTION WAIT\nNAME Chad ACTION PICK green_trapezoid PLACE panel6\n'
+The three lines must be in this exact robot set: Alice, Bob, Chad.
+Example: 'EXECUTE\nNAME Alice ACTION PICK blue_square PLACE panel2\nNAME Bob ACTION WAIT\nNAME Chad ACTION PICK yellow_trapezoid PLACE panel6\n'
 """
 
 class SortOneBlockTask(MujocoSimEnv):
@@ -554,5 +573,3 @@ if __name__ == "__main__":
     print(env.get_agent_prompt(obs, "Alice"))
     breakpoint()
     img=env.physics.render(camera_id="teaser", height=480, width=600)
-
-

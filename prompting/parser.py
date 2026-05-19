@@ -4,6 +4,7 @@ from rocobench.subtask_plan import LLMPathPlan
 from typing import List, Tuple, Dict, Union, Optional, Any
 from rocobench.envs import MujocoSimEnv, EnvState, RobotState
 from scipy.spatial.transform import Rotation, Slerp
+from .text_utils import strip_think
 
 class LLMResponseParser:
     """
@@ -31,8 +32,117 @@ class LLMResponseParser:
         self.use_preplace = use_preplace # if True, separate pre-place and place actions
         self.split_parsed_plans = split_parsed_plans 
 
+    def normalize_response(self, response: str) -> str:
+        """Extract the last valid EXECUTE block and canonicalize it.
+
+        Models sometimes wrap the action block in quotes, Markdown fences, or
+        explanatory text. The downstream parser and env should only see the
+        clean three-line action block.
+        """
+        if response is None:
+            return ""
+
+        text = strip_think(str(response)).replace("\r\n", "\n").replace("\r", "\n")
+        raw_lines = text.split("\n")
+        lines = []
+        for raw_line in raw_lines:
+            line = raw_line.strip()
+            if line.startswith("```"):
+                continue
+            line = line.strip(" \t'\"`")
+            if line:
+                lines.append(line)
+
+        blocks = []
+        execute_idxs = [
+            i for i, line in enumerate(lines)
+            if re.search(r"\bEXECUTE\b", line, flags=re.IGNORECASE)
+        ]
+        if not execute_idxs:
+            execute_idxs = [-1]
+
+        for block_idx, start in enumerate(execute_idxs):
+            end = execute_idxs[block_idx + 1] if block_idx + 1 < len(execute_idxs) else len(lines)
+            block_lines = lines[start + 1:end] if start >= 0 else lines
+            actions = {}
+            for line in block_lines:
+                canonical = self._canonicalize_action_line(line)
+                if canonical is None:
+                    continue
+                agent_name, action = canonical
+                if agent_name in self.agent_names:
+                    actions[agent_name] = action
+            if all(agent_name in actions for agent_name in self.agent_names):
+                blocks.append(actions)
+
+        if not blocks:
+            return str(response).strip()
+
+        actions = blocks[-1]
+        return self.format_action_response(actions)
+
+    def format_action_response(self, actions: Dict[str, str]) -> str:
+        lines = ["EXECUTE"]
+        for agent_name in self.agent_names:
+            lines.append(f"NAME {agent_name} ACTION {actions[agent_name]}")
+        return "\n".join(lines)
+
+    def _canonicalize_action_line(self, line: str) -> Optional[Tuple[str, str]]:
+        match = re.search(
+            r"\bNAME\s+([A-Za-z_][A-Za-z0-9_]*)\s+ACTION\s+(.+)$",
+            line,
+            flags=re.IGNORECASE,
+        )
+        if match is None:
+            return None
+
+        raw_agent_name = match.group(1).strip()
+        agent_name = next(
+            (name for name in self.agent_names if name.lower() == raw_agent_name.lower()),
+            raw_agent_name,
+        )
+        action_text = match.group(2).strip().strip(" \t'\"`")
+        if re.search(r"\bPATH\b", action_text, flags=re.IGNORECASE):
+            path_end = action_text.rfind("]")
+            if path_end != -1:
+                action_text = action_text[:path_end + 1]
+        else:
+            action_text = re.split(r"\s+#|\s+//|，|。|；|;", action_text, maxsplit=1)[0].strip()
+        action_text = action_text.strip(" \t'\"`")
+        if not action_text:
+            return None
+        action_text = self._canonicalize_action_keywords(action_text)
+
+        parts = action_text.split()
+        verb = parts[0].upper()
+        if verb in {"MOVE", "SWEEP"}:
+            if len(parts) < 2:
+                return None
+            target_match = re.match(r"[A-Za-z0-9_]+", parts[1].strip(" \t'\"`"))
+            if target_match is None:
+                return None
+            action = f"{verb} {target_match.group(0)}"
+        elif verb in {"WAIT", "DUMP"}:
+            action = verb
+        else:
+            action = action_text
+        return agent_name, action
+
+    def _canonicalize_action_keywords(self, action_text: str) -> str:
+        for keyword in ["PICK", "PLACE", "PUT", "OPEN", "MOVE", "SWEEP", "DUMP", "WAIT", "PATH"]:
+            action_text = re.sub(
+                rf"\b{keyword}\b",
+                keyword,
+                action_text,
+                flags=re.IGNORECASE,
+            )
+        return action_text
+
     def parse(self, obs: EnvState, response: str) -> Tuple[bool, str, List[LLMPathPlan]]: 
+        response = self.normalize_response(response)
         parsed = ''  
+        if 'EXECUTE' not in response:
+            return False, "Response missing 'EXECUTE' header.", []
         for keyword in self.response_keywords:
             if keyword not in response: 
                 return False, f"Response does not contain {keyword}." , []
@@ -963,16 +1073,26 @@ class LLMResponseParser:
         # Given a string such as '[(0.00,0.50,0.10), (0.00,0.50,0.10)].' 
         # convert it to a list of tuples of floats using regular expression match  re.
         triplet_strs = re.findall(r"\(([^)]+)\)", path_string)
+        if len(triplet_strs) == 0:
+            return None
         if ',' not in triplet_strs[0]:
             return None
         # remove all the non-numerical characters, e.g. parse "\"0.7" into "0.7", parse "?\"-1.2" into "-1.2" 
 
-        tuples = [
-            tuple([
-                float(
-                    re.sub(r"[^0-9\.\-]", "", x)
-                    ) for x in triplet_str.split(",")]) for triplet_str in triplet_strs
-        ] 
+        tuples = []
+        for triplet_str in triplet_strs:
+            values = []
+            for x in triplet_str.split(","):
+                cleaned = re.sub(r"[^0-9\.\-]", "", x)
+                if cleaned in {"", "-", ".", "-."}:
+                    return None
+                try:
+                    values.append(float(cleaned))
+                except ValueError:
+                    return None
+            if len(values) != 3:
+                return None
+            tuples.append(tuple(values))
         return tuples 
 
     def parse_path(self, line: str) -> List[Tuple[float, float, float]]:
@@ -980,7 +1100,10 @@ class LLMResponseParser:
         Parses the path from the line of the response. 
         """
         # parse the path
-        gripper_path = line.split('PATH ')[1]  
+        path_match = re.search(r"\bPATH\b\s*(.*)$", line, flags=re.IGNORECASE | re.DOTALL)
+        if path_match is None:
+            return None
+        gripper_path = path_match.group(1)
         # a string of [(x,y,z), (x,y,z), ...], convert it to a list of tuples of floats
         tuples = self.parse_path_string(gripper_path) 
 
@@ -1009,4 +1132,4 @@ NAME Bob ACTION PICK pink_polygon PLACE bin_polygon
 NAME Chad ACTION PICK yellow_trapezoid PLACE bin_trapezoid
         """
     )
-    print(succ, parsed, path_plans) 
+    print(succ, parsed, path_plans)
