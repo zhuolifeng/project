@@ -1,6 +1,7 @@
 import os
 import pickle
 import json
+import random
 import numpy as np
 import logging
 import time
@@ -176,8 +177,11 @@ class LLMRunner:
         """ uses planner """
         # Record start time for timeout detection
         run_start_time = time.time()
-        
-        self.env.seed(np_seed=run_id)
+
+        run_seed = self.np_seed + run_id
+        random.seed(run_seed)
+        np.random.seed(run_seed)
+        self.env.seed(np_seed=run_seed)
         if not skip_reset:
             self.env.reset(reload=True) # NOTE: need to do this to reset the model.eq_active vals
         env = self.env
