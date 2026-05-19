@@ -15,7 +15,6 @@ from rocobench.envs import MujocoSimEnv, EnvState
 from .feedback import FeedbackManager
 from .parser import LLMResponseParser
 from .ollama_client import query_ollama_chat
-from .context_compactor import compact_items, compact_text
 from .text_utils import strip_think
 from .task_hints import build_task_hint
 
@@ -105,16 +104,15 @@ class DialogPrompter:
             execute_feedback += "\n".join(self.failed_plans) + "\n"
             execute_feedback += "[Hard Rule] Do NOT re-emit any of the failed plans above. If reachability/collision/constraint failed, change the action or assign it to the other robot.\n"
 
-        chat_history = compact_items(chat_history)
         chat_history = "[Previous Chat]\n" + "\n".join(chat_history) if len(chat_history) > 0 else ""
 
         system_prompt = f"{action_desp}\n{round_history}\n{execute_feedback}{agent_prompt}\n{chat_history}\n"
 
         if self.use_feedback and len(feedback_history) > 0:
-            system_prompt += "\n".join(compact_items(feedback_history))
+            system_prompt += "\n".join(feedback_history)
 
         if len(current_chat) > 0:
-            system_prompt += "[Current Chat]\n" + "\n".join(compact_items(current_chat)) + "\n"
+            system_prompt += "[Current Chat]\n" + "\n".join(current_chat) + "\n"
 
         task_hint = build_task_hint(self.env, obs)
         if task_hint:
@@ -346,15 +344,15 @@ This previous response from [{final_agent}] failed to parse!: '{final_response}'
     def _extract_summary(self, summary_response: str) -> str:
         match = re.search(r"<summary>(.*?)</summary>", summary_response, re.DOTALL)
         if match:
-            return compact_text(match.group(1).strip())
-        return compact_text(summary_response, max_chars=600)
+            return match.group(1).strip()
+        return summary_response.strip()
 
     def _summarize_round(self, obs_desp, parsed_plan: str) -> str:
         after_obs = self._describe_obs_for_summary(obs_desp).replace("[Scene description]", "")
         before_obs = ""
         if self.old_obs is not None:
             before_obs = self._describe_obs_for_summary(self.old_obs).replace("[Scene description]", "")
-        chats = "\n".join(compact_items(self.latest_chat_history))
+        chats = "\n".join(self.latest_chat_history)
         summarize_prompt = "<Task Information>"
         summarize_prompt += f"The task descriptions are as follows:\n<Task Description>{self.env.describe_task_context()}</Task Description>\n\n"
         for agent in self.robot_agent_names:
@@ -388,10 +386,10 @@ This previous response from [{final_agent}] failed to parse!: '{final_response}'
             try:
                 self.round_history_brief.append(self._summarize_round(obs_desp, parsed_plan))
             except Exception as exc:
-                print(f"Summary generation failed, falling back to compact action history: {exc}")
-                self.round_history_brief.append(compact_text(parsed_plan))
+                print(f"Summary generation failed, falling back to action history: {exc}")
+                self.round_history_brief.append(parsed_plan)
         else:
-            self.failed_plans.append(compact_text(parsed_plan))
+            self.failed_plans.append(parsed_plan)
         return
 
     def post_episode_update(self):
