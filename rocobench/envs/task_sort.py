@@ -50,10 +50,12 @@ Planning checklist for this task:
 - Valid handoff placements are only: blue_square or pink_polygon to panel3, yellow_trapezoid to panel5.
 - Alice must never PLACE pink_polygon on panel4. Bob must never PLACE blue_square on panel2 or yellow_trapezoid on panel6. Chad must never PLACE pink_polygon on panel4 or blue_square on panel2.
 - Never move a cube that is already on its target panel. Never place a cube back on its current panel.
+- Exception for recovery: if pink_polygon is stuck on panel5 after Bob failed to move it to panel4, Chad may PICK pink_polygon PLACE panel5 once to reposition it on the shared panel for Bob.
 - Every robot action must be valid from the current scene before this EXECUTE block starts. Do not ask a robot to pick a cube that another robot will move later in the same round.
 - A handoff always takes two rounds: first one robot places the cube on the shared panel, then in the next round the receiving robot picks it.
 - Do not output all WAIT unless all three cubes are already on their target panels.
 - If feedback reports reachability, IK, parsing, or execution failure, do not repeat the same failed action; choose a reachable handoff, a reachable target placement, or WAIT only for the blocked robot.
+- If feedback says Bob failed or IK failed while moving pink_polygon from panel5 to panel4, the next action should be: Alice WAIT, Bob WAIT, Chad PICK pink_polygon PLACE panel5. After that, Bob should try PICK pink_polygon PLACE panel4 again.
 - In one EXECUTE block, output exactly one line for Alice, one line for Bob, and one line for Chad; do not repeat or omit any robot.
 - In one EXECUTE block, do not assign the same cube to more than one robot. If two useful actions would use the same pickup area, choose one and set the other robot to WAIT.
 - If two unsorted cubes are on the same shared panel, move only one of them in the current EXECUTE block; this avoids crowding at the same pickup area.
@@ -78,7 +80,7 @@ SORTING_ACTION_SPACE="""
 Only PICK an object if your gripper is empty. Target <location> for PLACE should be panel or a bin.
 PLACE without PICK is invalid. Always write object movement exactly as: PICK <object name> PLACE <panel>.
 Never place a cube on a panel outside that robot's reachable panels. Valid target map is blue_square -> panel2, pink_polygon -> panel4, yellow_trapezoid -> panel6.
-Never use PICK <object> PLACE <same current panel>; it is a no-op and invalid.
+Never use PICK <object> PLACE <same current panel>; it is a no-op and invalid, except Chad may use PICK pink_polygon PLACE panel5 only as recovery after Bob failed to move pink_polygon from panel5 to panel4.
 Do not chain dependent handoff actions in one EXECUTE block; the receiver may only PICK after the cube is already on its reachable panel in the current scene.
 If two cubes are on panel3 or panel5, only one robot may PICK from that panel in the current EXECUTE block; the other robot must WAIT.
 [Action Output Instruction]
@@ -504,6 +506,8 @@ In the plan, at least one robot should be acting, you can't all WAIT.
     
     def get_task_feedback(self, llm_plan, pose_dict):
         feedback = ""
+        obs = self.get_obs()
+        picked_from_panels = []
         for agent_name, action_str in llm_plan.action_strs.items():
             if ('PICK' in action_str and 'PLACE' not in action_str) or \
                 ('PLACE' in action_str and 'PICK' not in action_str):
@@ -511,6 +515,19 @@ In the plan, at least one robot should be acting, you can't all WAIT.
             if 'PICK' in action_str and 'PLACE' in action_str:
                 obj = action_str.split('PICK')[1].split('PLACE')[0].strip()
                 target = action_str.split('PLACE')[1].strip()
+                current_panel = self.get_cube_panel(obs, obj) if obj in self.cube_names else None
+                if current_panel in ["panel3", "panel5"]:
+                    picked_from_panels.append((agent_name, obj, current_panel))
+                is_panel5_reposition = (
+                    agent_name == "Chad"
+                    and obj == "pink_polygon"
+                    and current_panel == "panel5"
+                    and target == "panel5"
+                )
+                if obj in self.cube_names and current_panel == self.cube_to_bin[obj]:
+                    feedback += f"{agent_name} must not PICK {obj}; it is already on its target {current_panel}. "
+                if obj in self.cube_names and target == current_panel and not is_panel5_reposition:
+                    feedback += f"{agent_name}'s ACTION is a no-op: {obj} is already on {current_panel}. "
                 if obj in self.cube_names and target in self.cube_to_bin.values():
                     correct_panel = self.cube_to_bin[obj]
                     if correct_panel not in target:
@@ -518,6 +535,13 @@ In the plan, at least one robot should be acting, you can't all WAIT.
                             [correct_panel, 'panel3', 'panel5']
                         )
                         feedback += f"{agent_name}'s ACTION is not valid, {obj} cube can only be placed on {valid_panels}, but not on {target}"
+                if obj in self.cube_names and target == "panel3" and agent_name not in ["Alice", "Bob"]:
+                    feedback += f"{agent_name}'s ACTION is not valid, only Alice or Bob may use panel3 as a handoff. "
+                if obj in self.cube_names and target == "panel5" and agent_name not in ["Bob", "Chad"]:
+                    feedback += f"{agent_name}'s ACTION is not valid, only Bob or Chad may use panel5 as a handoff/recovery panel. "
+        shared_pick_panels = [panel for _, _, panel in picked_from_panels if panel in ["panel3", "panel5"]]
+        if len(shared_pick_panels) != len(set(shared_pick_panels)):
+            feedback += "Only one robot may PICK from the same shared panel in one EXECUTE block; set the other robot to WAIT. "
         if all(['WAIT' in action_str for action_str in llm_plan.action_strs.values()]):
             feedback += f"You can't all WAIT. The task is not complete, at least one robot should be acting."
         return feedback 

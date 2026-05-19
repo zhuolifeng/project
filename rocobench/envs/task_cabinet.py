@@ -55,8 +55,10 @@ At each round, given 'Scene description' and 'Environment feedback', use it to r
 Each robot does **exactly** one ACTION per round, selected from only one of the above 4 options.
 Planning checklist for this task:
 - Phase 1: PICK/OPEN both door handles; after a door is open, that robot should WAIT to hold it open.
+- If either cabinet door is closed, object actions are forbidden. First restore the closed door by OPENing its handle with the robot already holding that handle.
 - Phase 2: only when both doors are open and held open, PICK mug PLACE mug_coaster and PICK cup PLACE cup_coaster.
 - If Alice is holding a door handle and cup is still inside cabinet, Alice may leave the handle and directly output PICK cup PLACE cup_coaster; this is the required recovery action when Alice is the only valid cup robot.
+- Alice must not leave left_door_handle to PICK mug. In the left-cabinet placement, Chad handles mug and Alice handles cup.
 - Move at most one object among mug/cup per EXECUTE block. Do not PICK mug and cup in the same round.
 - For mug/cup, choose the robot that can currently reach the object's present position and the target coaster; do not assume Chad should always manipulate objects.
 - Respect each agent prompt's reachable objects. If feedback says an object or handle is unreachable, do not repeat the same failed action or same failed EXECUTE block.
@@ -456,11 +458,17 @@ End your response by either: 1) output PROCEED, if the plans require further dis
     def get_task_feedback(self, llm_plan, pose_dict):
         feedback = ""
         object_pick_actions = []
+        left_open, right_open = self._door_open_states()
+        obs = self.get_obs()
+        alice_contacts = getattr(obs, self.robot_name_map_inv["Alice"]).contacts
+        bob_contacts = getattr(obs, self.robot_name_map_inv["Bob"]).contacts
         for agent_name, action_str in llm_plan.action_strs.items():
             if 'PICK mug' in action_str or 'PICK cup' in action_str:
                 if 'PLACE' not in action_str:
                     feedback += f"{agent_name}'s ACTION must contain both PICK and PLACE. "
                 object_pick_actions.append((agent_name, action_str))
+                if not left_open or not right_open:
+                    feedback += "Do not PICK mug or cup while any cabinet door is closed; first OPEN the closed door handle. "
             for obj in ["mug", "cup"]:
                 if f"PICK {obj}" in action_str:
                     obj_pos = self.physics.data.body(obj).xpos
@@ -472,6 +480,8 @@ End your response by either: 1) output PROCEED, if the plans require further dis
                     feedback += f"{agent_name} cannot reach door. "
                 if 'PICK cup' in action_str and agent_name == "Chad":
                     feedback += "Chad must not PICK cup in this cabinet placement; assign cup to Alice or WAIT. "
+                if 'PICK mug' in action_str and agent_name == "Alice":
+                    feedback += "Alice must not PICK mug in this cabinet placement; assign mug to Chad after both doors are open. "
                 if ('PICK mug' in action_str or 'PICK cup' in action_str) and agent_name == "Bob":
                     feedback += "Bob cannot reach mug or cup in this cabinet placement. "
             else:
@@ -481,9 +491,30 @@ End your response by either: 1) output PROCEED, if the plans require further dis
                     feedback += "Chad cannot reach mug or cup in this cabinet placement. "
         if len(object_pick_actions) > 1:
             feedback += "Move at most one object among mug/cup per EXECUTE block; set the other object robot to WAIT. "
+        if not left_open:
+            alice_action = llm_plan.action_strs.get("Alice", "")
+            if "left_door_handle" in alice_contacts:
+                if "OPEN left_door_handle" not in alice_action:
+                    feedback += "Left door is closed and Alice is holding left_door_handle; Alice must OPEN left_door_handle before any object action. "
+            elif "PICK left_door_handle" not in alice_action:
+                feedback += "Left door is closed; Alice must PICK left_door_handle before opening it. "
+        if not right_open:
+            bob_action = llm_plan.action_strs.get("Bob", "")
+            if "right_door_handle" in bob_contacts:
+                if "OPEN right_door_handle" not in bob_action:
+                    feedback += "Right door is closed and Bob is holding right_door_handle; Bob must OPEN right_door_handle before any object action. "
+            elif "PICK right_door_handle" not in bob_action:
+                feedback += "Right door is closed; Bob must PICK right_door_handle before opening it. "
         if all(['WAIT' in action_str for action_str in llm_plan.action_strs.values()]):
             feedback += "At least one robot should be acting, you can't all WAIT."
         return feedback 
+
+    def _door_open_states(self):
+        left_qpos_slice = self.physics.named.data.qpos._convert_key("leftdoorhinge")
+        right_qpos_slice = self.physics.named.data.qpos._convert_key("rightdoorhinge")
+        left_qpos = self.physics.data.qpos[left_qpos_slice.start]
+        right_qpos = self.physics.data.qpos[right_qpos_slice.start]
+        return left_qpos <= -2, right_qpos >= 2
 
     def describe_robot_capability(self):
         return ""
@@ -496,6 +527,9 @@ Current cabinet-side reachability:
 - Alice can reach left_door_handle, mug, cup.
 - Bob can reach right_door_handle only; Bob must not PICK mug or cup.
 - Chad can reach right_door_handle and mug. In this benchmark, Chad must not PICK cup; assign cup to Alice.
+- If left door is closed and Alice is holding left_door_handle, Alice must OPEN left_door_handle; do not PICK mug or cup until both doors are open.
+- If right door is closed and Bob is holding right_door_handle, Bob must OPEN right_door_handle; do not PICK mug or cup until both doors are open.
+- When both doors are open and mug is not on mug_coaster, assign mug to Chad, not Alice.
 - If cup is inside cabinet and mug is already on its coaster, Alice should PICK cup PLACE cup_coaster even if she is holding left_door_handle. Bob should WAIT to keep right_door_handle open and Chad should WAIT.
 - If Alice is holding left_door_handle or Bob is holding right_door_handle, WAIT is preferred only when no valid object action is needed.
 """
