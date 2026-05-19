@@ -48,6 +48,7 @@ Planning checklist for this task:
 - Use shared handoff panels when needed: Alice/Bob can hand off through panel3; Bob/Chad can hand off through panel5.
 - Valid final placements are only: Alice places blue_square on panel2; Bob places pink_polygon on panel4; Chad places yellow_trapezoid on panel6.
 - Valid handoff placements are only: blue_square or pink_polygon to panel3, yellow_trapezoid to panel5.
+- Alice must never PLACE pink_polygon on panel4. Bob must never PLACE blue_square on panel2 or yellow_trapezoid on panel6. Chad must never PLACE pink_polygon on panel4 or blue_square on panel2.
 - Never move a cube that is already on its target panel. Never place a cube back on its current panel.
 - Every robot action must be valid from the current scene before this EXECUTE block starts. Do not ask a robot to pick a cube that another robot will move later in the same round.
 - A handoff always takes two rounds: first one robot places the cube on the shared panel, then in the next round the receiving robot picks it.

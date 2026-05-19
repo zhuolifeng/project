@@ -55,6 +55,7 @@ Each robot does **exactly** one ACTION per round, selected from only one of the 
 Planning checklist for this task:
 - Phase 1: PICK/OPEN both door handles; after a door is open, that robot should WAIT to hold it open.
 - Phase 2: only when both doors are open and held open, PICK mug PLACE mug_coaster and PICK cup PLACE cup_coaster.
+- Move at most one object among mug/cup per EXECUTE block. Do not PICK mug and cup in the same round.
 - For mug/cup, choose the robot that can currently reach the object's present position and the target coaster; do not assume Chad should always manipulate objects.
 - Respect each agent prompt's reachable objects. If feedback says an object or handle is unreachable, do not repeat the same failed action or same failed EXECUTE block.
 - If Chad fails to reach cup or mug once, Chad must WAIT on the next replan for that object, and another reachable robot must be assigned if one exists. If no reachable robot exists, do not repeat Chad's failed action.
@@ -452,16 +453,32 @@ End your response by either: 1) output PROCEED, if the plans require further dis
                 
     def get_task_feedback(self, llm_plan, pose_dict):
         feedback = ""
+        object_pick_actions = []
         for agent_name, action_str in llm_plan.action_strs.items():
             if 'PICK mug' in action_str or 'PICK cup' in action_str:
                 if 'PLACE' not in action_str:
-                    feedback += f"{agent_name}'s ACTION must contain both PICK and PLACE"
+                    feedback += f"{agent_name}'s ACTION must contain both PICK and PLACE. "
+                object_pick_actions.append((agent_name, action_str))
+            for obj in ["mug", "cup"]:
+                if f"PICK {obj}" in action_str:
+                    obj_pos = self.physics.data.body(obj).xpos
+                    coaster_pos = self.coaster_pos[f"{obj}_coaster"]
+                    if np.linalg.norm(obj_pos - coaster_pos) <= self.align_threshold:
+                        feedback += f"{agent_name} must not PICK {obj}; {obj} is already on its coaster. "
             if self.cabinet_pos[0] < 0:
                 if 'door_handle' in action_str and agent_name == "Chad":
-                    feedback += f"{agent_name} cannot reach door"
+                    feedback += f"{agent_name} cannot reach door. "
+                if 'PICK cup' in action_str and agent_name == "Chad":
+                    feedback += "Chad must not PICK cup in this cabinet placement; assign cup to Alice or WAIT. "
+                if ('PICK mug' in action_str or 'PICK cup' in action_str) and agent_name == "Bob":
+                    feedback += "Bob cannot reach mug or cup in this cabinet placement. "
             else:
                 if 'door_handle' in action_str and agent_name == "Bob":
-                    feedback += f"{agent_name} cannot reach door"
+                    feedback += f"{agent_name} cannot reach door. "
+                if ('PICK mug' in action_str or 'PICK cup' in action_str) and agent_name == "Chad":
+                    feedback += "Chad cannot reach mug or cup in this cabinet placement. "
+        if len(object_pick_actions) > 1:
+            feedback += "Move at most one object among mug/cup per EXECUTE block; set the other object robot to WAIT. "
         if all(['WAIT' in action_str for action_str in llm_plan.action_strs.values()]):
             feedback += "At least one robot should be acting, you can't all WAIT."
         return feedback 
@@ -476,7 +493,7 @@ End your response by either: 1) output PROCEED, if the plans require further dis
 Current cabinet-side reachability:
 - Alice can reach left_door_handle, mug, cup.
 - Bob can reach right_door_handle only; Bob must not PICK mug or cup.
-- Chad can reach right_door_handle, mug, cup.
+- Chad can reach right_door_handle and mug. In this benchmark, Chad must not PICK cup; assign cup to Alice.
 - If Alice is holding left_door_handle or Bob is holding right_door_handle, WAIT is preferred to keep the door open, but Alice may recover mug or cup when the object is no longer inside the cabinet and Chad failed to reach it.
 """
         else:
