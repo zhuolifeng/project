@@ -45,7 +45,7 @@ class DialogPrompter:
         env: MujocoSimEnv,
         parser: LLMResponseParser,
         feedback_manager: FeedbackManager, 
-        max_tokens: int = 65536, 
+        max_tokens: int = 2048, 
         debug_mode: bool = False,
         use_waypoints: bool = False,
         robot_name_map: Dict[str, str] = {"panda": "Bob"},
@@ -286,7 +286,7 @@ Your response is:
                     system_prompt=system_prompt,
                     user_prompt=user_prompt,
                     temperature=self.temperature,
-                    max_tokens=65536,
+                    max_tokens=self.max_tokens,
                 )
 
                 print('======= response ======= \n ', response)

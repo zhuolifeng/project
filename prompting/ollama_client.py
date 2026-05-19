@@ -6,7 +6,6 @@ import requests
 
 
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
-DEFAULT_RETRY_MULTIPLIER = 4
 
 
 def _parse_ollama_think(value: str) -> Any:
@@ -73,10 +72,7 @@ def query_ollama_chat(
         eval_count = data.get("eval_count", "unknown")
         if thinking and max_tokens is not None:
             retry_options = dict(options)
-            retry_options["num_predict"] = max(
-                max_tokens + 256,
-                max_tokens * DEFAULT_RETRY_MULTIPLIER,
-            )
+            retry_options["num_predict"] = max_tokens
             retry_payload = dict(payload)
             retry_payload["options"] = retry_options
             response = requests.post(
@@ -95,7 +91,7 @@ def query_ollama_chat(
         if thinking:
             hint = (
                 " The model produced thinking tokens but no final content; "
-                "increase max_tokens or set OLLAMA_THINK=false."
+                "set OLLAMA_THINK=false to reserve the 2048 token budget for final content."
             )
         raise RuntimeError(
             "Ollama returned an empty chat response "

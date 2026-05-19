@@ -64,7 +64,7 @@ class SingleThreadPrompter:
         num_replans: int = 3,
         debug_mode: bool = False,   
         temperature: float = 0,
-        max_tokens: int = 65536, 
+        max_tokens: int = 2048, 
         llm_source: str = "gpt-4",
     ):
         self.env = env 
@@ -293,7 +293,7 @@ Re-format to strictly follow [Action Output Instruction]!
                     system_prompt=SYSTEM_PROMPT,
                     user_prompt=system_prompt + user_prompt,
                     temperature=self.temperature,
-                    max_tokens=65536,
+                    max_tokens=self.max_tokens,
                 )
 
                 print('======= response ======= \n ', response)
@@ -387,7 +387,7 @@ Re-format to strictly follow [Action Output Instruction]!
         Chad can place {panel5,panel6,panel7} and can not place {panel1,panel2,panel3,panel4};
         The blue_square is unidirectionally picked and placed to panel2.
         The pink_polygon is unidirectionally picked and placed to panel4.
-        The pink_polygon is unidirectionally picked and placed to panel6.
+        The yellow_trapezoid is unidirectionally picked and placed to panel6.
 Current Phase Objective: {Phase_Goal}
 Environment Feedback: {Last_Step_Status}
 Historical Actions: {Previous_Actions}

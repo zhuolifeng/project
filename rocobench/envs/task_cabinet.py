@@ -39,6 +39,7 @@ CABINET_ACTION_SPACE="""
 4) WAIT: stays at current position, choose WAIT to hold the door open.
 <handle> must be either left or right door handle. Only OPEN a door after you already PICKed its handle, after you OPENed a door, must WAIT at the same spot to hold it open. 
 <object> must be either mug or cup, <location> must be the correct coaster.
+Use only these four action forms. Never invent MOVE, MOVE TO, GO TO, or coordinate-only actions.
 
 [Action Output Instruction]
 Must first output 'EXECUTE\n', then give **exactly** one action per robot, put each on a new line.
@@ -49,6 +50,12 @@ CABINET_TASK_CONTEXT="""3 robots, Alice, Bob, Chad together must take a mug and 
 Both left and right cabinet doors should be OPENed and stays open before anything inside can be PICKed and PLACEed. Robots must coordinate to complete the task most efficiently while avoiding collision.
 At each round, given 'Scene description' and 'Environment feedback', use it to reason about the task, and improve any previous plans. 
 Each robot does **exactly** one ACTION per round, selected from only one of the above 4 options.
+Planning checklist for this task:
+- Phase 1: PICK/OPEN both door handles; after a door is open, that robot should WAIT to hold it open.
+- Phase 2: only when both doors are open and held open, PICK mug PLACE mug_coaster and PICK cup PLACE cup_coaster.
+- Respect each agent prompt's reachable objects. If feedback says an object or handle is unreachable, do not repeat the same failed action.
+- If an object manipulation fails, change the assigned robot or wait with the blocked robot while another valid door/object action progresses.
+- Do not output all WAIT unless both mug and cup are already on their correct coasters.
 """
 CABINET_TASK_CHAT_PROMPT="""Robots discuss to find the best strategy. When each robot talk, it must first reflects on the task status, and its own capability. 
 Carefully consider environment feedback and others' responses. It must coordinate with other robots' paths to avoid collision. They talk in order [Alice],[Bob],[Chad],[Alice],..., then, after reaching agreement, output an EXECUTE to summarize the plan, and stop talking.
