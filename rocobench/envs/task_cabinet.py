@@ -140,10 +140,14 @@ class CabinetTask(MujocoSimEnv):
 
         self.align_threshold = 0.25
         self.coaster_pos = dict()
+        coaster_place_bias = {
+            "mug_coaster": np.array([0.0, 0.0, 0.25]),
+            # cup uses an off-center grasp site, so keep a small x bias for a more stable final drop.
+            "cup_coaster": np.array([0.09, 0.0, 0.25]),
+        }
         for geom_name in ["mug_coaster", "cup_coaster"]:
             self.coaster_pos[geom_name] = self.physics.data.geom(geom_name).xpos.copy()
-            self.coaster_pos[geom_name][2] += 0.25 # move up a bit
-            self.coaster_pos[geom_name][0] += 0.09 # because cup_right grasp site is not at center
+            self.coaster_pos[geom_name] += coaster_place_bias[geom_name]
         self.open_pose = dict(
             left_door_handle=self.compute_open_pose("left_door_handle"),
             right_door_handle=self.compute_open_pose("right_door_handle"),
