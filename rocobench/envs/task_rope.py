@@ -3,6 +3,7 @@ import copy
 import time
 import cv2 
 import random
+import re
 import numpy as np  
 from pydantic import dataclasses, validator 
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
@@ -22,6 +23,8 @@ ROPE_TASK_OBJECTS=[
     "groove_left_end",
     "groove_right_end",
 ]
+ROPE_ENDS = ["rope_front_end", "rope_back_end"]
+GROOVE_ENDS = ["groove_left_end", "groove_right_end"]
 ROPE_INIT_RANGE = (
     np.array([-1.2, 0.6, 0.2]),
     np.array([-1.3, 0.45, 0.2]),
@@ -43,22 +46,40 @@ There's an obstacle block wall between the rope and the groove, so the robots mu
 The rope is heavy, so they must hold the rope at the same time, and distance between their grippers must stay fixed, so the rope doesn't drop.
 At each round, if given 'Scene description' and 'Environment feedback', use it to reason about the task and improve any previous plans. 
 Each robot should reach for the closet target, if a robot failed IK to reach a goal, change strategy to a different action.
+
+CRITICAL ROPE STATE MACHINE:
+- If both robots are holding nothing, both robots must PICK, and Alice/Bob must PICK two different rope ends.
+- If both robots are already holding rope ends, both robots must PUT, and the two rope ends must enter two different groove endpoints.
+- Never PUT both rope ends into the same groove endpoint.
+- Never keep PICKing after both robots are holding rope; never PUT before both robots are holding rope.
+- If the previous feedback reported IK failure for the same robot and coordinate, do not repeat the same end target or key waypoint. Swap assignment, choose a different route, or raise/shift middle waypoints.
+- If the previous feedback reported obstacle_wall collision or RRT timeout, the next PUT must raise middle waypoints above obstacle top plus margin while keeping z < 0.55, and route around the wall instead of only changing the final goal.
+- Once both rope ends are in the groove, do not move the rope again.
 """
 
 ROPE_ACTION_SPACE="""
 [Action Options]
 1) PICK <obj> PATH <path>: only PICK if your gripper is empty, <object> can be either rope_front_end or rope_back_end
-2) PUT <obj> <location> PATH <path>: PUT on either groove_left_end or groove_right_end only if you have already PICKed the rope, each end can only hold only one end of the rope, not both.
-Choose a different <obj> to PICK or PUT if Environment Feedback failed.
-Each <path> must contain exactly four coordinates, each must be evenly distanced from each other and interpolates between start and goal.
-PATHs must efficiently reach target while avoiding collision avoid collision (e.g. move above the objects' heights).
-The PATHs must do top-down pick or place: 
-- move directly atop the rope's end by height 0.2 before PICK: e.g. Alice's gripper is at (0, 0, 0.3), rope_front_end is at (-0.25, 0.39, 0.29): ACTION PICK rope_front_end PATH [(0, 0.1, 0.3),(0, 0.2, 0.49),(-0.1, 0.25, 0.49),(-0.25, 0.39, 0.49)]
-- lift rope up before moving it to PUT: e.g. Bob's gripper is at (0.9, 0, 0.2), groove_left_end is at (0.35, 0.35, 0.43): ACTION PLACE rope_front_end groove_left_end PATH [(0.9,0.0,0.5), (0.5, 0, 0.5), (0.2, 0.1, 0.5),(0.35, 0.35, 0.5)]
+2) PUT <obj> <location> PATH <path>: PUT on either groove_left_end or groove_right_end only if you have already PICKed a rope end.
+Only these actions are valid: PICK and PUT. Do not output MOVE, WAIT, PLACE, DRAG, or any other action.
+Choose a different <obj>, robot assignment, or waypoint route if Environment Feedback failed.
+Each <path> must contain exactly four coordinates, each coordinate is (x,y,z).
+All PATH z values must stay above the table and lower than 0.55.
+For PICK, plan a top-down approach to the selected rope end.
+For PUT, lift the rope first. Middle waypoints should usually use z about 0.48 to 0.52, route around obstacle_wall, and then descend into the groove endpoint.
+When both robots are holding rope, Alice and Bob must PUT their held rope ends into different groove endpoints.
+Example PICK:
+EXECUTE
+NAME Alice ACTION PICK rope_front_end PATH [(0.00, 0.10, 0.48), (-0.30, 0.22, 0.48), (-0.70, 0.32, 0.48), (-1.10, 0.42, 0.48)]
+NAME Bob ACTION PICK rope_back_end PATH [(0.05, 0.95, 0.48), (-0.10, 0.78, 0.48), (-0.35, 0.62, 0.48), (-0.55, 0.50, 0.48)]
+Example PUT:
+EXECUTE
+NAME Alice ACTION PUT rope_front_end groove_left_end PATH [(-0.95, 0.32, 0.52), (-0.55, 0.14, 0.52), (-0.15, 0.14, 0.52), (0.20, 0.50, 0.52)]
+NAME Bob ACTION PUT rope_back_end groove_right_end PATH [(-0.35, 0.62, 0.52), (-0.15, 0.88, 0.52), (0.45, 0.88, 0.52), (1.00, 0.50, 0.52)]
 
 [Action Output Instruction]
 First output 'EXECUTE\n', then give exactly one ACTION per robot, each on a new line.
-Example: 'EXECUTE\nNAME Alice ACTION PUT rope_front_end groove_right_end PATH <path>\nNAME Bob ACTION PUT rope_back_end groove_left_end PATH <path>\n'
+Example: 'EXECUTE\nNAME Alice ACTION PUT rope_front_end groove_left_end PATH <path>\nNAME Bob ACTION PUT rope_back_end groove_right_end PATH <path>\n'
 """
 
 ROPE_TASK_CHAT_PROMPT="""They discuss to find the best paths. Carefully consider environment feedback and others' responses. Robots must coordinate paths to avoid collision.
@@ -126,6 +147,214 @@ class MoveRopeTask(MujocoSimEnv):
     @property
     def waypoint_std_threshold(self):
         return 0.3
+
+    def _rope_end_from_contacts(self, contacts: Set[str]) -> Optional[str]:
+        contact_text = ",".join(str(contact) for contact in contacts)
+        if ROPE_BACK_BODY in contact_text or "rope_back_end" in contact_text:
+            return "rope_back_end"
+        if ROPE_FRONT_BODY in contact_text or "rope_front_end" in contact_text:
+            return "rope_front_end"
+        return None
+
+    def _agent_holding_rope_end(self, obs: EnvState, agent_name: str) -> Optional[str]:
+        robot_name = self.robot_name_map_inv[agent_name]
+        robot_state = getattr(obs, robot_name)
+        return self._rope_end_from_contacts(robot_state.contacts)
+
+    def _rope_end_position(self, rope_end: str) -> np.ndarray:
+        body_name = ROPE_FRONT_BODY if rope_end == "rope_front_end" else ROPE_BACK_BODY
+        return self.physics.data.body(body_name).xpos.copy()
+
+    def _groove_end_position(self, groove_end: str) -> np.ndarray:
+        return self.physics.data.site(groove_end).xpos.copy()
+
+    def _table_height(self) -> float:
+        return float(self.physics.data.body("table_top").xpos[2] + 0.15)
+
+    def _obstacle_top_height(self) -> float:
+        return float(max(self.physics.data.site(name).xpos[2] for name in OBSTACLE_CORNER_NAMES))
+
+    def _safe_path_z(self, prefer: float = 0.50) -> float:
+        min_z = max(self._table_height() + 0.08, self._obstacle_top_height() + 0.04)
+        return float(np.clip(max(prefer, min_z), self._table_height() + 0.08, 0.53))
+
+    def _format_path(self, points: List[np.ndarray]) -> str:
+        return "[" + ", ".join(
+            f"({point[0]:.2f}, {point[1]:.2f}, {point[2]:.2f})"
+            for point in points
+        ) + "]"
+
+    def _format_actions(self, actions: Dict[str, str]) -> str:
+        return "\n".join([
+            "EXECUTE",
+            f"NAME Alice ACTION {actions['Alice']}",
+            f"NAME Bob ACTION {actions['Bob']}",
+        ])
+
+    def _extract_rope_actions(self, response: str) -> Dict[str, str]:
+        actions = {}
+        for line in str(response).splitlines():
+            match = re.search(
+                r"\bNAME\s+(Alice|Bob)\s+ACTION\s+(.+)$",
+                line,
+                flags=re.IGNORECASE,
+            )
+            if match is None:
+                continue
+            agent_name = "Alice" if match.group(1).lower() == "alice" else "Bob"
+            action = match.group(2).strip().strip(" \t'\"`")
+            if "PATH" in action.upper() and "[" in action and "]" in action:
+                action = action[:action.rfind("]") + 1]
+            actions[agent_name] = action
+        return actions
+
+    def _parse_rope_action(self, action: str) -> Tuple[str, Optional[str], Optional[str]]:
+        parts = action.strip().split()
+        if len(parts) == 0:
+            return "", None, None
+        verb = parts[0].upper()
+        obj = parts[1] if len(parts) > 1 else None
+        location = None
+        if verb == "PUT" and len(parts) > 2:
+            location = parts[2]
+        return verb, obj, location
+
+    def _pick_assignments(self, obs: EnvState) -> Dict[str, str]:
+        # Default to the empirically stable division, but give Bob the higher-y
+        # end when rope_back_end is pulled too far toward Alice's side.
+        front_y = self._rope_end_position("rope_front_end")[1]
+        back_y = self._rope_end_position("rope_back_end")[1]
+        if back_y < 0.40 and front_y > back_y + 0.05:
+            return {"Alice": "rope_back_end", "Bob": "rope_front_end"}
+        return {"Alice": "rope_front_end", "Bob": "rope_back_end"}
+
+    def _build_pick_path(self, obs: EnvState, agent_name: str, rope_end: str) -> str:
+        robot_name = self.robot_name_map_inv[agent_name]
+        start = getattr(obs, robot_name).ee_xpos.copy()
+        target = self._rope_end_position(rope_end)
+        z = min(0.50, max(self._table_height() + 0.18, target[2] + 0.30))
+        start_top = np.array([start[0], start[1], z])
+        target_top = np.array([target[0], target[1], z])
+        points = [
+            start_top * (1 - alpha) + target_top * alpha
+            for alpha in [0.25, 0.50, 0.75, 1.00]
+        ]
+        return self._format_path(points)
+
+    def _build_put_path(self, obs: EnvState, agent_name: str, groove_end: str) -> str:
+        robot_name = self.robot_name_map_inv[agent_name]
+        start = getattr(obs, robot_name).ee_xpos.copy()
+        target = self._groove_end_position(groove_end)
+        z = self._safe_path_z(prefer=0.52)
+
+        wall_sites = [self.physics.data.site(name).xpos.copy() for name in OBSTACLE_CORNER_NAMES]
+        wall_x = float(np.mean([site[0] for site in wall_sites]))
+        wall_front_y = float(min(site[1] for site in wall_sites))
+        wall_back_y = float(max(site[1] for site in wall_sites))
+        if agent_name == "Alice":
+            detour_y = max(0.08, wall_front_y - 0.12)
+        else:
+            detour_y = min(1.05, wall_back_y + 0.12)
+        before_x = wall_x - 0.18
+        after_x = max(wall_x + 0.28, 0.45) if agent_name == "Bob" else wall_x + 0.28
+
+        detour_before = np.array([before_x, detour_y, z])
+        lift_toward_detour = np.array([
+            start[0] * 0.55 + before_x * 0.45,
+            start[1] * 0.55 + detour_y * 0.45,
+            z,
+        ])
+        detour_after = np.array([after_x, detour_y, z])
+        target_top = np.array([target[0], target[1], z])
+        return self._format_path([lift_toward_detour, detour_before, detour_after, target_top])
+
+    def _make_pick_actions(self, obs: EnvState) -> Dict[str, str]:
+        assignments = self._pick_assignments(obs)
+        return {
+            agent_name: (
+                f"PICK {rope_end} PATH "
+                f"{self._build_pick_path(obs, agent_name, rope_end)}"
+            )
+            for agent_name, rope_end in assignments.items()
+        }
+
+    def _make_put_actions(
+        self,
+        obs: EnvState,
+        requested_actions: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, str]:
+        held = {
+            agent_name: self._agent_holding_rope_end(obs, agent_name)
+            for agent_name in ["Alice", "Bob"]
+        }
+        if held["Alice"] is None:
+            held["Alice"] = "rope_front_end"
+        if held["Bob"] is None or held["Bob"] == held["Alice"]:
+            held["Bob"] = "rope_back_end" if held["Alice"] == "rope_front_end" else "rope_front_end"
+
+        groove_targets = {"Alice": "groove_left_end", "Bob": "groove_right_end"}
+        if requested_actions is not None:
+            requested_targets = {
+                agent_name: self._parse_rope_action(requested_actions.get(agent_name, ""))[2]
+                for agent_name in ["Alice", "Bob"]
+            }
+            if (
+                requested_targets["Alice"] == requested_targets["Bob"]
+                and requested_targets["Alice"] in GROOVE_ENDS
+            ):
+                shared_target = requested_targets["Alice"]
+                other_target = "groove_right_end" if shared_target == "groove_left_end" else "groove_left_end"
+                if shared_target == "groove_left_end":
+                    groove_targets = {"Alice": shared_target, "Bob": other_target}
+                else:
+                    groove_targets = {"Alice": other_target, "Bob": shared_target}
+
+        return {
+            agent_name: (
+                f"PUT {held[agent_name]} {groove_targets[agent_name]} PATH "
+                f"{self._build_put_path(obs, agent_name, groove_targets[agent_name])}"
+            )
+            for agent_name in ["Alice", "Bob"]
+        }
+
+    def correct_action_response(
+        self,
+        obs: EnvState,
+        response: str,
+        previous_actions: Optional[Dict[str, str]] = None,
+    ) -> Tuple[str, str]:
+        """Rope-only state-machine guard for action_and_path responses."""
+        actions = self._extract_rope_actions(response)
+        held = {
+            agent_name: self._agent_holding_rope_end(obs, agent_name)
+            for agent_name in ["Alice", "Bob"]
+        }
+        both_empty = held["Alice"] is None and held["Bob"] is None
+        both_holding = held["Alice"] is not None and held["Bob"] is not None
+
+        if both_empty:
+            corrected = self._format_actions(self._make_pick_actions(obs))
+            if corrected != response:
+                return corrected, "Rope state: both grippers are empty; forcing PICK of two different rope ends with four-point PATHs."
+            return response, ""
+
+        if both_holding:
+            corrected = self._format_actions(self._make_put_actions(obs, requested_actions=actions))
+            if corrected != response:
+                return corrected, "Rope state: both robots hold rope; forcing PUT of held ends into different groove endpoints with raised detour PATHs."
+            return response, ""
+
+        if len(actions) != 2:
+            if any(end is not None for end in held.values()):
+                corrected = self._format_actions(self._make_put_actions(obs, requested_actions=actions))
+                return corrected, "Could not find two valid actions; completing the rope phase with PUT actions only."
+            corrected = self._format_actions(self._make_pick_actions(obs))
+            return corrected, "Could not find two valid actions; starting the rope phase with PICK actions only."
+
+        cleaned = self._format_actions(actions)
+        if cleaned != response:
+            return cleaned, "Cleaned rope action output format."
+        return response, ""
 
     def get_target_pos(self, agent_name, target_name) -> Optional[np.ndarray]: 
         ret = None 
@@ -312,14 +541,9 @@ class MoveRopeTask(MujocoSimEnv):
         robot_state = getattr(obs, robot_name)
         x, y, z = robot_state.ee_xpos
         contacts = robot_state.contacts 
-        if len(contacts) == 0:
+        obj = self._rope_end_from_contacts(contacts)
+        if obj is None:
             obj = "nothing"
-        else:
-            obj = ",".join([c for c in contacts]) 
-            if ROPE_FRONT_BODY in obj:
-                obj = 'rope_front_end'
-            elif ROPE_BACK_BODY in obj:
-                obj = 'rope_back_end'
         agent_name = self.robot_name_map[robot_name]
         robot_desp = f"{agent_name}'s gripper: ({x:.2f}, {y:.2f}, {z:.2f}), holding {obj}"
         return robot_desp  
@@ -354,8 +578,17 @@ class MoveRopeTask(MujocoSimEnv):
     
     def get_task_feedback(self, llm_plan, pose_dict):
         """Get the feedback on planned target poses for each robot at the same time step"""
-        task_feedback = ""
+        feedbacks = []
         obs = self.get_obs() 
+        actions = llm_plan.action_strs
+        parsed = {
+            agent_name: self._parse_rope_action(action_str)
+            for agent_name, action_str in actions.items()
+        }
+        held = {
+            agent_name: self._agent_holding_rope_end(obs, agent_name)
+            for agent_name in ["Alice", "Bob"]
+        }
         # if len(obs.panda.contacts) > 0 and len(obs.ur5e_robotiq.contacts) > 0:
         #     # if ("rope_front_end" in obs.panda.contacts and "rope_back_end" in obs.ur5e_robotiq.contacts) or \
         #     #     ("rope_front_end" in obs.ur5e_robotiq.contacts and "rope_back_end" in obs.panda.contacts):
@@ -364,10 +597,101 @@ class MoveRopeTask(MujocoSimEnv):
         #     dist = np.linalg.norm(pose1.position - pose2.position)
         #     if dist < self.rope_length * 0.8 or dist > self.rope_length * 1.2:
         #         task_feedback += f"PATH at: Alice {pose1.pos_string}, Bob: {pose2.pos_string} are wrong: distance between them is {dist}, but it must be {self.rope_length:.2f}"   
-        for agent_name, action_str in llm_plan.action_strs.items(): 
-            if 'PLACE' in action_str or 'WAIT' in action_str or 'MOVE' in action_str:
-                task_feedback += f"{agent_name}'s ACTION is not supported" 
-        return task_feedback
+        for agent_name, action_str in actions.items():
+            upper_action = action_str.upper()
+            if any(bad_action in upper_action for bad_action in ["PLACE", "WAIT", "MOVE", "DRAG"]):
+                feedbacks.append(f"{agent_name}'s ACTION is not supported. Rope action space only allows PICK and PUT.")
+
+            verb, obj, location = parsed[agent_name]
+            if verb not in {"PICK", "PUT"}:
+                feedbacks.append(f"{agent_name}'s ACTION is not supported. Use only PICK or PUT.")
+            if verb == "PICK" and held[agent_name] is not None:
+                feedbacks.append(f"{agent_name} is already holding {held[agent_name]}; do not PICK after holding rope.")
+            if verb == "PUT" and held[agent_name] is None:
+                feedbacks.append(f"{agent_name} is not holding rope yet; both robots must PICK different rope ends before PUT.")
+
+        pick_targets = [
+            parsed[agent_name][1]
+            for agent_name in ["Alice", "Bob"]
+            if parsed.get(agent_name, ("", None, None))[0] == "PICK"
+        ]
+        if len(pick_targets) == 2:
+            if any(target not in ROPE_ENDS for target in pick_targets):
+                feedbacks.append("PICK target must be rope_front_end or rope_back_end.")
+            if pick_targets[0] == pick_targets[1]:
+                feedbacks.append("Alice and Bob must pick two different rope ends.")
+
+        put_targets = [
+            parsed[agent_name][2]
+            for agent_name in ["Alice", "Bob"]
+            if parsed.get(agent_name, ("", None, None))[0] == "PUT"
+        ]
+        if len(put_targets) == 2:
+            if any(target not in GROOVE_ENDS for target in put_targets):
+                feedbacks.append("PUT target must be groove_left_end or groove_right_end.")
+            if put_targets[0] == put_targets[1]:
+                feedbacks.append("Alice and Bob must put the two rope ends into different groove endpoints.")
+
+        verbs = [parsed.get(agent_name, ("", None, None))[0] for agent_name in ["Alice", "Bob"]]
+        if held["Alice"] is None and held["Bob"] is None and any(verb == "PUT" for verb in verbs):
+            feedbacks.append("Both robots are empty-handed; the next valid step is PICK, not PUT.")
+        if held["Alice"] is not None and held["Bob"] is not None and any(verb == "PICK" for verb in verbs):
+            feedbacks.append("Both robots are already holding rope; the next valid step is PUT, not PICK.")
+        if "PICK" in verbs and "PUT" in verbs:
+            feedbacks.append("Alice and Bob must stay in the same rope phase: both PICK first, then both PUT.")
+
+        if feedbacks:
+            feedbacks.append("The previous waypoint caused IK failure; do not repeat the same waypoint, swap assignment or choose a different route.")
+            feedbacks.append("Raise middle waypoints above obstacle top plus margin, while keeping z < 0.55.")
+        return " ".join(feedbacks)
+
+    def summarize_round(
+        self,
+        obs_before: EnvState,
+        obs_after: EnvState,
+        parsed_plan: str,
+    ) -> str:
+        held = {
+            agent_name: self._agent_holding_rope_end(obs_after, agent_name)
+            for agent_name in ["Alice", "Bob"]
+        }
+        rope_positions = {
+            rope_end: self._rope_end_position(rope_end)
+            for rope_end in ROPE_ENDS
+        }
+        groove_left = self._groove_end_position("groove_left_end")[:2]
+        groove_right = self._groove_end_position("groove_right_end")[:2]
+        front_xy = rope_positions["rope_front_end"][:2]
+        back_xy = rope_positions["rope_back_end"][:2]
+        front_in_left = np.linalg.norm(front_xy - groove_left) < self.align_threshold
+        front_in_right = np.linalg.norm(front_xy - groove_right) < self.align_threshold
+        back_in_left = np.linalg.norm(back_xy - groove_left) < self.align_threshold
+        back_in_right = np.linalg.norm(back_xy - groove_right) < self.align_threshold
+        both_in_groove = (front_in_left and back_in_right) or (front_in_right and back_in_left)
+
+        lines = ["[Round Summary]"]
+        lines.append("[Executed Action]")
+        lines.append(parsed_plan.strip())
+        lines.append("[Current Rope Holding]")
+        for agent_name in ["Alice", "Bob"]:
+            held_desc = held[agent_name] if held[agent_name] is not None else "nothing"
+            lines.append(f"{agent_name}: holding {held_desc}")
+        lines.append("[Current Rope End Positions]")
+        for rope_end in ROPE_ENDS:
+            x, y, z = rope_positions[rope_end]
+            lines.append(f"{rope_end}: ({x:.2f}, {y:.2f}, {z:.2f})")
+        lines.append("[Next Required Phase]")
+        if both_in_groove:
+            lines.append("Both rope ends are already aligned with different groove endpoints; do not move the rope again.")
+        elif held["Alice"] is not None and held["Bob"] is not None:
+            lines.append("Both robots are holding rope; next action must be PUT into different groove endpoints.")
+        elif held["Alice"] is None and held["Bob"] is None:
+            lines.append("Both robots are empty-handed; next action must be PICK two different rope ends.")
+        else:
+            lines.append("Only one robot is holding rope; recover by assigning the other robot to the other rope end and avoid mixed PICK/PUT phases.")
+        lines.append("[Failure Recovery Rule]")
+        lines.append("If the last attempt failed, do not repeat the same unreachable waypoint or same-groove collision; change assignment or route.")
+        return "\n".join(lines)
     
     def get_agent_prompt(self, obs: EnvState, agent_name: str):
         robot_name = self.robot_name_map_inv[agent_name]
@@ -447,4 +771,3 @@ if __name__ == "__main__":
     print(env.get_agent_prompt(obs, "Alice"))
     print(env.get_agent_prompt(obs, "Bob"))
     breakpoint()
-    

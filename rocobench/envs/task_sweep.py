@@ -37,7 +37,15 @@ SWEEP_BROOM_OFFSET=0.432 # fix height offset for panda's broom handle, obs.panda
 SWEEP_DUSTPAN_HEIGHT=0.23
 SWEEP_TASK_CONTEXT="""Alice is a robot holding a dustpan, Bob is a robot holding a broom, together they must sweep up all the cubes on the table.
 To sweep up a cube, Alice must place the dustpan to one side, while Bob must sweep the cube from the other side into the dustpan.
-At each round, given 'Scene description' and 'Environment feedback', use it to reason about the task, and improve any previous plans. Each robot does **exactly** one action per round.\n
+At each round, given 'Scene description' and 'Environment feedback', use it to reason about the task, and improve any previous plans. Each robot does **exactly** one action per round.
+
+CRITICAL STATE MACHINE:
+- If a cube is inside dustpan or inside trash_bin, never MOVE to it and never SWEEP it.
+- If Alice and Bob are already at the same on-table cube, the only valid next action is Alice WAIT and Bob SWEEP that cube.
+- Do not repeat MOVE to the same cube when both robots are already there.
+- Do not DUMP until no cubes remain on the table.
+- Prefer completing one cube fully: MOVE cube -> SWEEP cube -> choose next on-table cube.
+- Output exactly three lines and no explanation.\n
 """
 
 SWEEP_ACTION_SPACE="""
@@ -47,11 +55,25 @@ SWEEP_ACTION_SPACE="""
 3) WAIT, stays at the current spot.
 4) DUMP, only when there are one or more cubes in the dustpan, Alice can DUMP it into trash_bin.
 Only SWEEP a cube after both robots MOVEed to the cube.
+Never SWEEP or MOVE to a cube that is already inside dustpan or inside trash_bin.
+Never DUMP while any cube is still on the table.
 [Action Output Instruction]
-Must first output 'EXECUTE\n', then give exactly one action per robot, put each on a new line.
-Example#1: 'EXECUTE\nNAME Alice ACTION MOVE red_cube\nNAME Bob ACTION MOVE red_cube\n'
-Example#2: 'EXECUTE\nNAME Alice ACTION WAIT\nNAME Bob ACTION SWEEP red_cube\n'
-Example#3: 'EXECUTE\nNAME Alice ACTION DUMP\nNAME Bob ACTION MOVE green_cube\n'
+Output exactly three lines, no quotes, no Markdown, no extra text:
+EXECUTE
+NAME Alice ACTION <Alice action>
+NAME Bob ACTION <Bob action>
+Example#1:
+EXECUTE
+NAME Alice ACTION MOVE red_cube
+NAME Bob ACTION MOVE red_cube
+Example#2:
+EXECUTE
+NAME Alice ACTION WAIT
+NAME Bob ACTION SWEEP red_cube
+Example#3:
+EXECUTE
+NAME Alice ACTION DUMP
+NAME Bob ACTION WAIT
 """
 
 SWEEP_CHAT_PROMPT="""They discuss to find the best strategy. When each robot talk, it first reflects on the task status and its own capability. 
@@ -117,15 +139,230 @@ class SweepTask(MujocoSimEnv):
         )
          
         self.align_threshold = 0.1
+
+    def _cube_status(self, obs: EnvState, cube_name: str) -> str:
+        contacts = obs.objects[cube_name].contacts
+        if 'trash_bin_bottom' in contacts:
+            return "trash_bin"
+        if 'dustpan_bottom' in contacts:
+            return "dustpan"
+        return "table"
+
+    def get_cube_statuses(self, obs: EnvState) -> Dict[str, str]:
+        return {cube: self._cube_status(obs, cube) for cube in self.cube_names}
+
+    def _agent_near_cube(self, obs: EnvState, agent_name: str, cube_name: str, xy_threshold: float = 0.16) -> bool:
+        robot_name = self.robot_name_map_inv[agent_name]
+        robot_state = getattr(obs, robot_name)
+        target_pos = self.get_target_pos(agent_name, cube_name)
+        if target_pos is None:
+            return False
+        return np.linalg.norm(robot_state.ee_xpos[:2] - target_pos[:2]) <= xy_threshold
+
+    def _both_agents_near_cube(self, obs: EnvState, cube_name: str) -> bool:
+        return (
+            self._agent_near_cube(obs, "Alice", cube_name)
+            and self._agent_near_cube(obs, "Bob", cube_name)
+        )
+
+    def _next_table_cube(self, obs: EnvState, avoid: Optional[str] = None) -> Optional[str]:
+        table_cubes = [cube for cube, status in self.get_cube_statuses(obs).items() if status == "table"]
+        candidates = [cube for cube in table_cubes if cube != avoid] or table_cubes
+        if len(candidates) == 0:
+            return None
+
+        alice = getattr(obs, self.robot_name_map_inv["Alice"]).ee_xpos[:2]
+        bob = getattr(obs, self.robot_name_map_inv["Bob"]).ee_xpos[:2]
+        center = (alice + bob) / 2
+        return min(
+            candidates,
+            key=lambda cube: np.linalg.norm(self.physics.data.site(cube).xpos[:2] - center),
+        )
+
+    def _format_actions(self, alice_action: str, bob_action: str) -> str:
+        return f"EXECUTE\nNAME Alice ACTION {alice_action}\nNAME Bob ACTION {bob_action}"
+
+    def _extract_actions(self, response: str) -> Dict[str, str]:
+        actions = {}
+        for line in response.splitlines():
+            if "NAME" not in line or "ACTION" not in line:
+                continue
+            try:
+                agent_name = line.split("NAME", 1)[1].split("ACTION", 1)[0].strip()
+                action = line.split("ACTION", 1)[1].strip().strip(" '\"`")
+            except IndexError:
+                continue
+            if agent_name in ["Alice", "Bob"]:
+                actions[agent_name] = action
+        return actions
+
+    def _action_verb_target(self, action: str) -> Tuple[str, Optional[str]]:
+        parts = action.strip().split()
+        if len(parts) == 0:
+            return "", None
+        verb = parts[0].upper()
+        target = parts[1] if len(parts) > 1 else None
+        return verb, target
+
+    def _move_both_response(self, obs: EnvState, avoid: Optional[str] = None) -> str:
+        target = self._next_table_cube(obs, avoid=avoid)
+        if target is not None:
+            return self._format_actions(f"MOVE {target}", f"MOVE {target}")
+        statuses = self.get_cube_statuses(obs)
+        if any(status == "dustpan" for status in statuses.values()):
+            return self._format_actions("DUMP", "WAIT")
+        return self._format_actions("WAIT", "WAIT")
+
+    def correct_action_response(
+        self,
+        obs: EnvState,
+        response: str,
+        previous_actions: Optional[Dict[str, str]] = None,
+    ) -> Tuple[str, str]:
+        """Sweep-specific rule guard for high-level LLM actions.
+
+        The LLM still proposes actions, but these state-machine constraints are
+        deterministic because failures here waste whole episodes.
+        """
+        statuses = self.get_cube_statuses(obs)
+        table_cubes = [cube for cube, status in statuses.items() if status == "table"]
+        dustpan_cubes = [cube for cube, status in statuses.items() if status == "dustpan"]
+
+        for cube in table_cubes:
+            if self._both_agents_near_cube(obs, cube):
+                corrected = self._format_actions("WAIT", f"SWEEP {cube}")
+                if corrected != response:
+                    return corrected, f"Both robots are already at on-table {cube}; forcing SWEEP."
+                return response, ""
+
+        actions = self._extract_actions(response)
+        alice_action = actions.get("Alice", "WAIT")
+        bob_action = actions.get("Bob", "WAIT")
+        alice_verb, alice_target = self._action_verb_target(alice_action)
+        bob_verb, bob_target = self._action_verb_target(bob_action)
+
+        if len(actions) < 2 and table_cubes:
+            corrected = self._move_both_response(obs)
+            return corrected, "Could not find a complete action block; moving both robots to a table cube."
+
+        sweep_target = bob_target if bob_verb == "SWEEP" else alice_target if alice_verb == "SWEEP" else None
+        if sweep_target is not None and statuses.get(sweep_target) != "table":
+            if table_cubes:
+                corrected = self._move_both_response(obs, avoid=sweep_target)
+                return corrected, f"Blocked SWEEP of non-table {sweep_target}; moving to next table cube."
+            if dustpan_cubes:
+                corrected = self._format_actions("DUMP", "WAIT")
+                return corrected, f"Blocked SWEEP of non-table {sweep_target}; all remaining cubes are in dustpan."
+        if sweep_target in table_cubes and not self._both_agents_near_cube(obs, sweep_target):
+            corrected = self._format_actions(f"MOVE {sweep_target}", f"MOVE {sweep_target}")
+            return corrected, f"Blocked SWEEP before both robots reached {sweep_target}; moving both robots there."
+
+        if (alice_verb == "DUMP" or bob_verb == "DUMP") and table_cubes:
+            corrected = self._move_both_response(obs)
+            return corrected, "Blocked early DUMP because cubes remain on the table."
+
+        invalid_move_targets = [
+            target for verb, target in [(alice_verb, alice_target), (bob_verb, bob_target)]
+            if verb == "MOVE" and target in statuses and statuses[target] != "table"
+        ]
+        if invalid_move_targets:
+            target = invalid_move_targets[0]
+            corrected = self._move_both_response(obs, avoid=target)
+            return corrected, f"Blocked MOVE to non-table {target}; choosing a valid next action."
+
+        move_targets = [
+            target for verb, target in [(alice_verb, alice_target), (bob_verb, bob_target)]
+            if verb == "MOVE" and target in table_cubes
+        ]
+        if move_targets:
+            target = move_targets[0]
+            repeated_move = (
+                previous_actions is not None
+                and previous_actions.get("Alice") == f"MOVE {target}"
+                and previous_actions.get("Bob") == f"MOVE {target}"
+                and alice_action == f"MOVE {target}"
+                and bob_action == f"MOVE {target}"
+            )
+            if repeated_move:
+                corrected = self._move_both_response(obs, avoid=target)
+                return corrected, f"Blocked repeated MOVE to {target}; choosing another table cube."
+            if alice_action != f"MOVE {target}" or bob_action != f"MOVE {target}":
+                corrected = self._format_actions(f"MOVE {target}", f"MOVE {target}")
+                return corrected, f"Both robots must MOVE to the same table cube {target}."
+
+        if len(table_cubes) == 0 and dustpan_cubes and not (alice_verb == "DUMP" and bob_verb == "WAIT"):
+            corrected = self._format_actions("DUMP", "WAIT")
+            return corrected, "No cubes remain on the table; forcing final DUMP."
+
+        cleaned = self._format_actions(alice_action, bob_action)
+        if cleaned != response:
+            return cleaned, "Cleaned action output format."
+        return response, ""
+
+    def summarize_round(
+        self,
+        obs_before: EnvState,
+        obs_after: EnvState,
+        parsed_plan: str,
+    ) -> str:
+        before_status = self.get_cube_statuses(obs_before)
+        after_status = self.get_cube_statuses(obs_after)
+
+        lines = ["[Round Summary]"]
+        lines.append("[Executed Action]")
+        lines.append(parsed_plan.strip())
+        lines.append("[Current Cube Status]")
+        for cube in self.cube_names:
+            lines.append(f"{cube}: {after_status[cube]}")
+
+        lines.append("[Robot Position Change]")
+        for agent_name in ["Alice", "Bob"]:
+            robot_name = self.robot_name_map_inv[agent_name]
+            before_pos = getattr(obs_before, robot_name).ee_xpos
+            after_pos = getattr(obs_after, robot_name).ee_xpos
+            delta = np.linalg.norm(after_pos - before_pos)
+            moved = "yes" if delta > 0.02 else "no"
+            lines.append(
+                f"{agent_name}: moved={moved}, delta={delta:.2f}, "
+                f"from=({before_pos[0]:.2f},{before_pos[1]:.2f},{before_pos[2]:.2f}), "
+                f"to=({after_pos[0]:.2f},{after_pos[1]:.2f},{after_pos[2]:.2f})"
+            )
+
+        swept = [
+            cube for cube in self.cube_names
+            if before_status[cube] == "table" and after_status[cube] == "dustpan"
+        ]
+        dumped = [
+            cube for cube in self.cube_names
+            if before_status[cube] != "trash_bin" and after_status[cube] == "trash_bin"
+        ]
+        lines.append("[State Changes]")
+        lines.append(f"swept_into_dustpan: {', '.join(swept) if swept else 'none'}")
+        lines.append(f"dumped_into_trash_bin: {', '.join(dumped) if dumped else 'none'}")
+        return "\n".join(lines)
         
     def get_task_feedback(self, llm_plan, pose_dict):
         feedback = ""
+        obs = self.get_obs()
+        statuses = self.get_cube_statuses(obs)
+        table_cubes = [cube for cube, status in statuses.items() if status == "table"]
         if 'SWEEP' in llm_plan.action_strs.get('Bob', ''):
             if "WAIT" not in llm_plan.action_strs.get('Alice', ''):
                 feedback = "Alice must WAIT while Bob SWEEPs"
+            target = llm_plan.action_strs.get('Bob', '').split('SWEEP', 1)[1].strip()
+            if statuses.get(target) != "table":
+                feedback = f"Cannot SWEEP {target}; it is not on the table."
+            elif not self._both_agents_near_cube(obs, target):
+                feedback = f"Cannot SWEEP {target}; both robots must first MOVE to the same cube."
+        if any('DUMP' in action for action in llm_plan.action_strs.values()) and len(table_cubes) > 0:
+            feedback = "Cannot DUMP while cubes remain on the table."
         for agent_name, action_str in llm_plan.action_strs.items():
             if 'MOVE' in action_str and "cube" not in action_str:
                 feedback = "MOVE target must be a cube, you can directly dump without moving to trash_bin"
+            if 'MOVE' in action_str:
+                target = action_str.split('MOVE', 1)[1].strip()
+                if target in statuses and statuses[target] != "table":
+                    feedback = f"Cannot MOVE to {target}; it is not on the table."
         return feedback
 
     def get_target_pos(self, agent_name, target_name) -> Optional[np.ndarray]: 
@@ -388,10 +625,10 @@ class SweepTask(MujocoSimEnv):
         x, y, z = cube_state.xpos.copy()
         cube_desp = f"{cube_name} is at ({x:.1f}, {y:.1f}, {z:.1f}), "
         contacts = cube_state.contacts 
-        if 'dustpan_bottom' in contacts:
-            cube_desp += f"inside dustpan; "
-        elif 'trash_bin_bottom' in contacts:
+        if 'trash_bin_bottom' in contacts:
             cube_desp += f"inside trash_bin; "
+        elif 'dustpan_bottom' in contacts:
+            cube_desp += f"inside dustpan; "
         else:
             cube_desp += f"on the table; "
         return cube_desp
@@ -502,5 +739,3 @@ if __name__ == "__main__":
     # 
     # plt.show()
     # im.save('sorting_seed0.jpg')
-
-

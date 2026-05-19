@@ -204,6 +204,7 @@ class LLMRunner:
             prompt_path = os.path.join(step_dir, "prompts")
             os.makedirs(prompt_path, exist_ok=self.overwrite)
 
+            obs_before_step = deepcopy(obs)
             sim_data = env.save_intermediate_state()
             data_fname = f"{step_dir}/env_init.pkl"
             with open(data_fname, "wb") as f:
@@ -308,8 +309,19 @@ class LLMRunner:
             with open(data_fname, "wb") as f:
                 pickle.dump(sim_data, f)
 
+            history_desp = ""
+            if (not rewind_env) and hasattr(env, "summarize_round"):
+                try:
+                    history_desp = env.summarize_round(
+                        obs_before=obs_before_step,
+                        obs_after=obs,
+                        parsed_plan=current_llm_plan[0].get_action_desp(),
+                    )
+                except Exception as exc:
+                    print(f"Warning: failed to summarize round history: {exc}")
+
             self.prompter.post_execute_update(
-                obs_desp=obs,
+                obs_desp=history_desp,
                 execute_success=(not rewind_env),
                 parsed_plan=current_llm_plan[0].get_action_desp()
             )
@@ -414,9 +426,6 @@ def main(args):
         args.control_freq = 20
         args.max_failed_waypoints = 0
         logging.warning("MopeRope requires max failed waypoints 0\n")
-        if not args.no_feedback:
-            args.tstep = 5
-            logging.warning("MoveRope needs only 5 tsteps\n")
 
     elif args.task == 'pack':
         args.output_mode = 'action_and_path'

@@ -15,6 +15,7 @@ from rocobench.envs import MujocoSimEnv, EnvState
 from .feedback import FeedbackManager
 from .parser import LLMResponseParser
 from .ollama_client import query_ollama_chat
+from .context_compactor import compact_items, compact_text
 
 
 PATH_PLAN_INSTRUCTION="""
@@ -44,7 +45,7 @@ class DialogPrompter:
         env: MujocoSimEnv,
         parser: LLMResponseParser,
         feedback_manager: FeedbackManager, 
-        max_tokens: int = 2048, 
+        max_tokens: int = 65536,
         debug_mode: bool = False,
         use_waypoints: bool = False,
         robot_name_map: Dict[str, str] = {"panda": "Bob"},
@@ -98,15 +99,16 @@ class DialogPrompter:
             execute_feedback = "Plans below failed to execute, improve them to avoid collision and smoothly reach the targets:\n"
             execute_feedback += "\n".join(self.failed_plans) + "\n"
 
+        chat_history = compact_items(chat_history)
         chat_history = "[Previous Chat]\n" + "\n".join(chat_history) if len(chat_history) > 0 else ""
             
         system_prompt = f"{action_desp}\n{round_history}\n{execute_feedback}{agent_prompt}\n{chat_history}\n" 
         
         if self.use_feedback and len(feedback_history) > 0:
-            system_prompt += "\n".join(feedback_history)
+            system_prompt += "\n".join(compact_items(feedback_history))
         
         if len(current_chat) > 0:
-            system_prompt += "[Current Chat]\n" + "\n".join(current_chat) + "\n"
+            system_prompt += "[Current Chat]\n" + "\n".join(compact_items(current_chat)) + "\n"
 
         return system_prompt 
 
@@ -115,7 +117,16 @@ class DialogPrompter:
             return ""
         ret = "[History]\n"
         for i, history in enumerate(self.round_history):
-            ret += f"== Round#{i} ==\n{history}\n"
+            ret += f"== Round#{i} ==\n{compact_text(history)}\n"
+        ret += f"== Current Round ==\n"
+        return ret
+
+    def get_round_history_brief(self):
+        if len(self.round_history_brief) == 0:
+            return self.get_round_history()
+        ret = "[History]\n"
+        for i, history in enumerate(self.round_history_brief):
+            ret += f"== Round#{i} ==\n{compact_text(history)}\n"
         ret += f"== Current Round ==\n"
         return ret
 
@@ -239,7 +250,7 @@ Your response is:
 
                 num_responses[agent_name] += 1
                 # strip all the repeated \n and blank spaces in response: 
-                pruned_response = response.strip()
+                pruned_response = compact_text(response)
                 # pruned_response = pruned_response.replace("\n", " ")
                 agent_responses.append(
                     f"[{agent_name}]:\n{pruned_response}"
@@ -284,7 +295,7 @@ Your response is:
                     system_prompt=system_prompt,
                     user_prompt=user_prompt,
                     temperature=self.temperature,
-                    max_tokens=self.max_tokens,
+                    max_tokens=65536,
                 )
 
                 print('======= response ======= \n ', response)
@@ -313,15 +324,15 @@ Your response is:
     def _extract_summary(self, summary_response: str) -> str:
         match = re.search(r"<summary>(.*?)</summary>", summary_response, re.DOTALL)
         if match:
-            return match.group(1).strip()
-        return summary_response.strip()
+            return compact_text(match.group(1).strip())
+        return compact_text(summary_response, max_chars=600)
 
     def _summarize_round(self, obs_desp, parsed_plan: str) -> str:
         after_obs = self._describe_obs_for_summary(obs_desp).replace("[Scene description]", "")
         before_obs = ""
         if self.old_obs is not None:
             before_obs = self._describe_obs_for_summary(self.old_obs).replace("[Scene description]", "")
-        chats = "\n".join(self.latest_chat_history)
+        chats = "\n".join(compact_items(self.latest_chat_history))
         summarize_prompt = "<Task Information>"
         summarize_prompt += f"The task descriptions are as follows:\n<Task Description>{self.env.describe_task_context()}</Task Description>\n\n"
         for agent in self.robot_agent_names:
@@ -355,11 +366,11 @@ Your response is:
             try:
                 self.round_history_brief.append(self._summarize_round(obs_desp, parsed_plan))
             except Exception as exc:
-                print(f"Summary generation failed, falling back to action history: {exc}")
-                self.round_history_brief.append(parsed_plan)
+                print(f"Summary generation failed, falling back to compact action history: {exc}")
+                self.round_history_brief.append(compact_text(parsed_plan))
         else:
             self.failed_plans.append(
-                parsed_plan
+                compact_text(parsed_plan)
             )
         return 
 
