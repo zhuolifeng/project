@@ -35,30 +35,26 @@ CABINET_ACTION_SPACE="""
 [Action Options]
 1) PICK <handle>.
 2) OPEN <handle>.
-3) PICK <object> PLACE <location>, <object> can be either cup or mug; use this only when the robot's gripper is empty.
-4) PLACE <object> <location>, use this when the robot is already holding mug or cup and needs to finish placing it.
-5) WAIT: stays at current position, choose WAIT to hold the door open.
+3) PICK <object> PLACE <location>, <object> can be either cup or mug; PICK and PLACE is considered one single ACTION, i.e. you must always PICK and PLACE together
+4) WAIT: stays at current position, choose WAIT to hold the door open.
 <handle> must be either left or right door handle. Only OPEN a door after you already PICKed its handle, after you OPENed a door, must WAIT at the same spot to hold it open. 
 <object> must be either mug or cup, <location> must be the correct coaster.
-If a robot is already holding mug or cup, it must use PLACE <object> <location>, not PICK <object> PLACE <location>.
-Use only these five action forms. Never invent MOVE, MOVE TO, GO TO, or coordinate-only actions.
+Use only these four action forms. Never invent MOVE, MOVE TO, GO TO, or coordinate-only actions.
 
 [Action Output Instruction]
 Must first output 'EXECUTE\n', then give **exactly** one action per robot, put each on a new line.
-Example: 'EXECUTE\nNAME Alice ACTION WAIT\nNAME Bob ACTION WAIT\nNAME Chad ACTION PLACE mug mug_coaster\n'
+Example: 'EXECUTE\nNAME Alice ACTION PICK mug PLACE mug_coaster\nNAME Bob ACTION WAIT\nNAME Chad ACTION OPEN left_door_handle\n'
 """
 
 CABINET_TASK_CONTEXT="""3 robots, Alice, Bob, Chad together must take a mug and a cup out of a cabinet and place them on the correct coasters.
 Both left and right cabinet doors should be OPENed and stays open before anything inside can be PICKed and PLACEed. Robots must coordinate to complete the task most efficiently while avoiding collision.
 At each round, given 'Scene description' and 'Environment feedback', use it to reason about the task, and improve any previous plans. 
-Each robot does **exactly** one ACTION per round, selected from only one of the above 5 options.
+Each robot does **exactly** one ACTION per round, selected from only one of the above 4 options.
 Planning checklist for this task:
 - Phase 1: PICK/OPEN both door handles; after a door is open, that robot should WAIT to hold it open.
-- Phase 2: only when both doors are open and held open, move mug to mug_coaster and cup to cup_coaster.
-- If a robot is empty-handed, use PICK mug PLACE mug_coaster or PICK cup PLACE cup_coaster.
-- If a robot is already holding mug or cup because a previous PICK succeeded but PLACE failed, continue with PLACE mug mug_coaster or PLACE cup cup_coaster.
+- Phase 2: only when both doors are open and held open, PICK mug PLACE mug_coaster and PICK cup PLACE cup_coaster.
 - Respect each agent prompt's reachable objects. If feedback says an object or handle is unreachable, do not repeat the same failed action.
-- If an object manipulation fails after the robot is holding the object, do not switch objects; PLACE the held object on its correct coaster.
+- If an object manipulation fails, change the assigned robot or wait with the blocked robot while another valid door/object action progresses.
 - Do not output all WAIT unless both mug and cup are already on their correct coasters.
 """
 CABINET_TASK_CHAT_PROMPT="""Robots discuss to find the best strategy. When each robot talk, it must first reflects on the task status, and its own capability. 
@@ -375,16 +371,6 @@ class CabinetTask(MujocoSimEnv):
         object_desp = ""
         cab_pos = self.physics.data.body("cabinet").xpos 
         for obj in ["mug", "cup"]:
-            holder = None
-            for robot_name, agent_name in self.robot_name_map.items():
-                robot_state = getattr(obs, robot_name)
-                if obj in getattr(robot_state, "contacts", []):
-                    holder = agent_name
-                    break
-            if holder is not None:
-                object_desp += f"{obj} is held by {holder}; "
-                continue
-
             obj_pos = self.physics.data.body(obj).xpos
             coaster_pos = self.coaster_pos[f"{obj}_coaster"] 
             if np.linalg.norm(obj_pos - cab_pos) < 0.35: 
@@ -481,53 +467,6 @@ End your response by either: 1) output PROCEED, if the plans require further dis
                 reward = 0 
                 break
         return reward, done
-
-    def _held_object(self, obs: EnvState, agent_name: str) -> Optional[str]:
-        robot_name = self.robot_name_map_inv[agent_name]
-        robot_state = getattr(obs, robot_name)
-        contacts = getattr(robot_state, "contacts", []) or []
-        for obj in ["mug", "cup"]:
-            if obj in contacts:
-                return obj
-        return None
-
-    def correct_action_response(
-        self,
-        obs: EnvState,
-        response: str,
-        previous_actions: Optional[Dict[str, str]] = None,
-    ) -> Tuple[str, str]:
-        """Recover from partially completed cabinet pick-place actions.
-
-        If a previous PICK succeeded but PLACE failed, the parser will reject a
-        repeated PICK. Rewrite that line to PLACE the currently held object.
-        """
-        corrected_lines = []
-        feedback = []
-
-        for line in response.splitlines():
-            stripped = line.strip()
-            if not stripped.startswith("NAME ") or " ACTION " not in stripped:
-                corrected_lines.append(line)
-                continue
-
-            prefix, action = stripped.split(" ACTION ", 1)
-            parts = prefix.split()
-            agent_name = parts[1] if len(parts) >= 2 else None
-            held = self._held_object(obs, agent_name) if agent_name in self.robot_name_map_inv else None
-
-            if held is not None and ("PICK mug" in action or "PICK cup" in action):
-                new_line = f"NAME {agent_name} ACTION PLACE {held} {held}_coaster"
-                corrected_lines.append(new_line)
-                feedback.append(
-                    f"{agent_name} is already holding {held}; rewrote PICK/PLACE to PLACE {held} {held}_coaster."
-                )
-            else:
-                corrected_lines.append(line)
-
-        if feedback:
-            return "\n".join(corrected_lines), " ".join(feedback)
-        return response, ""
                 
     def get_task_feedback(self, llm_plan, pose_dict):
         feedback = ""
@@ -535,12 +474,6 @@ End your response by either: 1) output PROCEED, if the plans require further dis
             if 'PICK mug' in action_str or 'PICK cup' in action_str:
                 if 'PLACE' not in action_str:
                     feedback += f"{agent_name}'s ACTION must contain both PICK and PLACE"
-            if action_str.startswith("PLACE "):
-                parts = action_str.split()
-                if len(parts) < 3 or parts[1] not in ["mug", "cup"]:
-                    feedback += f"{agent_name}'s PLACE action must be PLACE <mug|cup> <correct_coaster>"
-                elif parts[2] != f"{parts[1]}_coaster":
-                    feedback += f"{agent_name}'s ACTION must place {parts[1]} on {parts[1]}_coaster"
             if self.cabinet_pos[0] < 0:
                 if 'door_handle' in action_str and agent_name == "Chad":
                     feedback += f"{agent_name} cannot reach door"
