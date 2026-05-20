@@ -154,6 +154,10 @@ class CabinetTask(MujocoSimEnv):
         )
         self.cabinet_pos = self.physics.data.body("cabinet").xpos.copy()
 
+    @property
+    def use_preplace(self):
+        return True
+
     def get_allowed_collision_pairs(self) -> List[Tuple[int, int]]:
         ret = []
         cabinet_ids = self.get_all_body_ids('cabinet') 
