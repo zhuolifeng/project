@@ -1,4 +1,6 @@
 import os
+os.environ.setdefault("MUJOCO_GL", "egl")
+os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
 os.environ.setdefault("OLLAMA_THINK", "false")
 import pickle
 import json
