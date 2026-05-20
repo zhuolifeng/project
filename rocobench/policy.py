@@ -35,6 +35,9 @@ class PlannedPathPolicy:
         allowed_collision_pairs: Optional[List[Tuple[int, int]]] = None,
         plan_splitted: bool = False,
         timeout: int = 200,
+        release_control_freq: Optional[int] = None,
+        post_release_hold_steps: int = 0,
+        slow_release_objects: Optional[Tuple[str, ...]] = None,
     ):
         self.robot_names = robots.keys()
         self.robots = robots
@@ -70,6 +73,23 @@ class PlannedPathPolicy:
         self.skip_smooth_path = skip_smooth_path # skip smoothing the path, useful for debugging
         self.plan_splitted = plan_splitted # if True, the plan is splitted into two parts, one for each robot
         self.timeout = timeout # timeout for each planning step, in number of planning steps
+        self.release_control_freq = release_control_freq
+        self.post_release_hold_steps = post_release_hold_steps
+        self.slow_release_objects = slow_release_objects
+
+    def should_slow_release(self) -> bool:
+        if self.release_control_freq is None and self.post_release_hold_steps <= 0:
+            return False
+        for obj_info in self.tograsp.values():
+            if obj_info is None:
+                continue
+            if obj_info["grasp_val"] != 0:
+                continue
+            if self.slow_release_objects is None:
+                return True
+            if obj_info["obj_name"] in self.slow_release_objects:
+                return True
+        return False
 
 
     def ik_ee_poses_to_qpos(self, physics, ee_poses: Dict[str, Pose]) -> Dict[str, np.ndarray]:
@@ -258,7 +278,10 @@ class PlannedPathPolicy:
             # breakpoint()
             return None, path[1]
         path_ls = list(path[0])
-        path_ls = path_ls[::self.control_freq] + path_ls[-3:-1]
+        control_freq = self.control_freq
+        if self.should_slow_release() and self.release_control_freq is not None:
+            control_freq = max(1, self.release_control_freq)
+        path_ls = path_ls[::control_freq] + path_ls[-3:-1]
         return path_ls, path[1]
     
     def map_qpos_to_ctrl(self, physics, qpos: np.ndarray, include_inhand: bool = True) -> Dict[str, np.ndarray]:
@@ -433,6 +456,8 @@ class PlannedPathPolicy:
         end_qpos = path_ls[-1] 
         grasp_actions = self.get_grasp_action(physics, end_qpos)
         actions.extend(grasp_actions) 
+        if self.should_slow_release() and self.post_release_hold_steps > 0:
+            actions.extend(grasp_actions * self.post_release_hold_steps)
         actions.extend(
             self.plan_home(physics, end_qpos)
         )  
