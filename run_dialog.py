@@ -304,6 +304,7 @@ class LLMRunner:
             if rewind_env:
                 print("Rewinding the environment to before the first plan was executed.")
                 env.load_saved_state(sim_data)
+                obs = env.get_obs()
 
             else:
                 sim_data = env.save_intermediate_state()
@@ -469,6 +470,15 @@ def main(args):
     fname = os.path.join(args.data_dir, args.run_name, f"args_{timestamp}.json")
     os.makedirs(os.path.dirname(fname), exist_ok=True)
     json.dump(args_dict, open(fname, "w"), indent=2)
+    policy_kwargs = dict(
+        control_freq=args.control_freq,
+        use_weld=args.use_weld,
+        skip_direct_path=0,
+        skip_smooth_path=0,
+        check_relative_pose=args.rel_pose,
+    )
+    policy_kwargs.update(getattr(env, "slow_release_policy_kwargs", {}))
+
     runner = LLMRunner(
         env=env,
         data_dir=args.data_dir,
@@ -481,13 +491,7 @@ def main(args):
         llm_output_mode=args.output_mode, # "action_only" or "action_and_path"
         llm_comm_mode=args.comm_mode, # "chat" or "plan"
         llm_num_replans=args.num_replans,
-        policy_kwargs=dict(
-            control_freq=args.control_freq,
-            use_weld=args.use_weld,
-            skip_direct_path=0,
-            skip_smooth_path=0,
-            check_relative_pose=args.rel_pose,
-        ),
+        policy_kwargs=policy_kwargs,
         direct_waypoints=args.direct_waypoints,
         max_failed_waypoints=args.max_failed_waypoints,
         debug_mode=args.debug_mode,

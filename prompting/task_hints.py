@@ -204,11 +204,85 @@ def sandwich_hint(env: MujocoSimEnv, obs: EnvState) -> str:
     )
 
 
+def cabinet_hint(env: MujocoSimEnv, obs: EnvState) -> str:
+    cabinet_pos = np.array(getattr(env, "cabinet_pos", np.zeros(3)))
+    align_threshold = float(getattr(env, "align_threshold", 0.25))
+    left_side = cabinet_pos[0] < 0
+
+    def _object_state(name: str):
+        obj = _get_obj(obs, name)
+        xpos = None if obj is None else getattr(obj, "xpos", None)
+        if xpos is None:
+            return "unknown", None
+        xpos = np.array(xpos)
+        coaster = np.array(env.coaster_pos[f"{name}_coaster"])
+        if np.linalg.norm(xpos - coaster) < align_threshold:
+            return "coaster", xpos
+        if np.linalg.norm(xpos - cabinet_pos) < 0.35:
+            return "cabinet", xpos
+        return "outside", xpos
+
+    def _held_object(agent_name: str):
+        robot_name = env.robot_name_map_inv[agent_name]
+        state = getattr(obs, robot_name, None)
+        if state is None:
+            return None
+        contacts = set(getattr(state, "contacts", []) or [])
+        for name in ["cup", "mug"]:
+            if name in contacts:
+                return name
+        return None
+
+    door_desp = ""
+    try:
+        door_desp = env.describe_cabinet(obs, include_coords=False)
+    except Exception:
+        door_desp = ""
+
+    lines = ["[Cabinet Hard Rules]"]
+    if "left door is open" in door_desp and "right door is open" in door_desp:
+        lines.append("- Both doors are open. Robots already holding door handles should WAIT to keep the cabinet open unless a stricter recovery rule below applies.")
+
+    held_any = False
+    for agent_name in ["Alice", "Bob", "Chad"]:
+        held = _held_object(agent_name)
+        if held is None:
+            continue
+        held_any = True
+        lines.append(f"- {agent_name} is already holding {held}; do NOT assign another PICK to {agent_name}. Continue by placing {held} on {held}_coaster.")
+
+    recovery_lines = []
+    for name in ["cup", "mug"]:
+        state, xpos = _object_state(name)
+        if state == "coaster":
+            recovery_lines.append(f"- {name} is already on its coaster; do NOT PICK it again.")
+            continue
+        if state != "outside" or xpos is None:
+            continue
+        recovery_lines.append(
+            f"- Recovery priority: {name} is outside cabinet and not on its coaster at "
+            f"({xpos[0]:.2f}, {xpos[1]:.2f}, {xpos[2]:.2f}); recover {name} before switching to another object."
+        )
+        if name == "cup" and (xpos[1] >= 1.0 or xpos[2] <= 0.0):
+            recovery_lines.append("- Abnormal cup state: when cup.y >= 1.0 or cup.z <= 0.0, do NOT assign Chad to PICK cup PLACE cup_coaster.")
+        if name == "cup" and left_side:
+            recovery_lines.append("- Left-side cabinet reminder: be conservative with Chad on cup recovery; prefer Alice when Chad repeatedly causes unreachable or collision states.")
+
+    if recovery_lines:
+        lines.extend(recovery_lines)
+    elif not held_any:
+        lines.append("- No object is currently outside cabinet. Finish the remaining in-cabinet object pickups only after both doors are open and held open.")
+
+    return "\n".join(lines) + "\n"
+
+
 def build_task_hint(env: MujocoSimEnv, obs: EnvState) -> str:
     cls_name = env.__class__.__name__
     try:
         if cls_name == "PackGroceryTask":
             return pack_hint(env, obs)
+        if cls_name == "CabinetTask":
+            return cabinet_hint(env, obs)
         if cls_name == "MakeSandwichTask":
             return sandwich_hint(env, obs)
     except Exception as exc:

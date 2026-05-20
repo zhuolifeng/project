@@ -488,6 +488,74 @@ class LLMResponseParser:
             )
         return True, '', pick_plan
 
+    def parse_held_pick_and_place(
+        self,
+        agent_name,
+        obs: EnvState,
+        robot_state: RobotState,
+        action_desp: str,
+    ):
+        """Cabinet recovery path: allow PICK X PLACE target when X is already in hand."""
+        if "PLACE" not in action_desp:
+            return False, "Held-object action must contain PLACE.", []
+
+        obj_name = action_desp.split("PICK", 1)[1].split("PLACE", 1)[0].strip().split(" ")[0]
+        place_target_name = action_desp.split("PLACE", 1)[1].strip().replace(" ", "_")
+
+        held_info = self.adjust_inhand_names(agent_name, obs, robot_state, action_desp)
+        if held_info is None:
+            return False, f"Robot {agent_name} is not holding an object for {action_desp}.", []
+        held_obj_name, obj_site, joint_name = held_info
+        if held_obj_name != obj_name:
+            return False, f"Robot {agent_name} is holding {held_obj_name}, not {obj_name}.", []
+
+        place_target_pose = self.get_place_target_pose(
+            agent_name, obs, robot_state, place_target_name
+        )
+        if place_target_pose is None:
+            return False, f"PLACE target {place_target_name} does not exist in the environment.", []
+
+        if self._use_stable_place(obj_name, place_target_name):
+            pick_target_pose = np.array(robot_state.ee_pose)
+            dummy_pick_plan = dict(
+                robot_name=agent_name,
+                ee_targets=pick_target_pose,
+                ee_waypoints=self.add_direct_waypoints(
+                    ee_start=np.array(robot_state.ee_pose),
+                    ee_target=pick_target_pose,
+                ),
+                tograsp=None,
+                inhand=held_info,
+                action_strs=action_desp,
+                return_home=False,
+            )
+            return True, "parse success", self._build_stable_place_plans(
+                agent_name=agent_name,
+                action_desp=action_desp,
+                pick_plan=dummy_pick_plan,
+                pick_target_pose=pick_target_pose,
+                place_target_pose=place_target_pose,
+                obj_name=obj_name,
+                obj_site=obj_site,
+                inhand_info=held_info,
+                include_pick_plan=False,
+            )
+
+        place_waypoints = self.add_direct_waypoints(
+            ee_start=np.array(robot_state.ee_pose),
+            ee_target=place_target_pose,
+        )
+        place_plan = dict(
+            robot_name=agent_name,
+            ee_targets=place_target_pose,
+            ee_waypoints=place_waypoints,
+            tograsp=(obj_name, obj_site, 0),
+            inhand=held_info,
+            action_strs=action_desp,
+            return_home=True,
+        )
+        return True, "parse success", [place_plan]
+
     def parse_pick_and_place(
         self,
         agent_name, 
@@ -496,12 +564,20 @@ class LLMResponseParser:
         action_desp: str,
     ):
         """ this should help construct **3** LLMPathPlan objects, pick -> place -> move back to pre-pick pose""" 
+        requested_obj = action_desp.split('PICK')[1].split('PLACE')[0].strip().split(' ')[0]
+        held_info = self.adjust_inhand_names(agent_name, obs, robot_state, action_desp)
+        if held_info is not None and held_info[0] == requested_obj:
+            return self.parse_held_pick_and_place(
+                agent_name, obs, robot_state, action_desp
+            )
+
         parse_succ, reason, pick_plan = self.parse_pick_action(
             agent_name, obs, robot_state, action_desp
             )
         if not parse_succ:
             return False, reason, []
-        pick_target_pose = pick_plan[0]['ee_targets']
+        final_pick_plan = pick_plan[-1]
+        pick_target_pose = final_pick_plan['ee_targets']
 
         place_target_name = action_desp.split('PLACE')[1].strip().replace(' ', '_')
         
@@ -520,26 +596,114 @@ class LLMResponseParser:
         # update the target quat!
         place_target_pose[3:] = pick_target_pose[3:]
 
+        tograsp = final_pick_plan['tograsp']
+        obj_name, obj_site = tograsp[0], tograsp[1]
+        inhand_info = (
+            obj_name,
+            obj_site,
+            self.env.get_object_joint_name(obj_name),
+        )
+        if self._use_stable_place(obj_name, place_target_name):
+            return True, "parse success", self._build_stable_place_plans(
+                agent_name=agent_name,
+                action_desp=action_desp,
+                pick_plan=final_pick_plan,
+                pick_target_pose=pick_target_pose,
+                place_target_pose=place_target_pose,
+                obj_name=obj_name,
+                obj_site=obj_site,
+                inhand_info=inhand_info,
+            )
+
         place_waypoints = self.add_direct_waypoints(
             ee_start=pick_target_pose,
             ee_target=place_target_pose,
         )
-        tograsp = pick_plan[0]['tograsp']
-        obj_name, obj_site = tograsp[0], tograsp[1]
         
         place_plan = dict(
             robot_name=agent_name,
             ee_targets=place_target_pose,
             ee_waypoints=place_waypoints,
             tograsp=(obj_name, obj_site, 0),
-            inhand=None, # NOTE: tmp issue here, cannot set inhand to (obj_name, obj_site, joint_name) when planning ahead
+            inhand=inhand_info,
             action_strs=action_desp,
             return_home=True
         )
 
         current_pose = np.array(robot_state.ee_pose)
  
-        return True, "parse success", [pick_plan[0], place_plan] #, move_plan]
+        return True, "parse success", pick_plan + [place_plan] #, move_plan]
+
+    def _use_stable_place(self, obj_name: str, target_name: str) -> bool:
+        stable_objects = getattr(self.env, "stable_place_objects", ())
+        return obj_name in stable_objects and target_name == f"{obj_name}_coaster"
+
+    def _build_stable_place_plans(
+        self,
+        agent_name: str,
+        action_desp: str,
+        pick_plan: Dict,
+        pick_target_pose: np.ndarray,
+        place_target_pose: np.ndarray,
+        obj_name: str,
+        obj_site: str,
+        inhand_info: Optional[Tuple[str, str, str]] = None,
+        include_pick_plan: bool = True,
+    ) -> List[Dict]:
+        hover_height = float(getattr(self.env, "stable_place_hover_height", 0.18))
+        lift_height = float(getattr(self.env, "stable_place_lift_height", 0.14))
+        if inhand_info is None:
+            inhand_info = (
+                obj_name,
+                obj_site,
+                self.env.get_object_joint_name(obj_name),
+            )
+
+        hover_pose = place_target_pose.copy()
+        hover_pose[2] += hover_height
+        lift_pose = place_target_pose.copy()
+        lift_pose[2] += lift_height
+
+        hover_plan = dict(
+            robot_name=agent_name,
+            ee_targets=hover_pose,
+            ee_waypoints=self.add_direct_waypoints(
+                ee_start=pick_target_pose,
+                ee_target=hover_pose,
+            ),
+            tograsp=None,
+            inhand=inhand_info,
+            action_strs=action_desp,
+            return_home=False,
+        )
+        lower_and_release_plan = dict(
+            robot_name=agent_name,
+            ee_targets=place_target_pose,
+            ee_waypoints=self.add_direct_waypoints(
+                ee_start=hover_pose,
+                ee_target=place_target_pose,
+            ),
+            tograsp=(obj_name, obj_site, 0),
+            inhand=inhand_info,
+            action_strs=action_desp,
+            return_home=False,
+        )
+        lift_plan = dict(
+            robot_name=agent_name,
+            ee_targets=lift_pose,
+            ee_waypoints=self.add_direct_waypoints(
+                ee_start=place_target_pose,
+                ee_target=lift_pose,
+            ),
+            tograsp=None,
+            inhand=None,
+            action_strs=action_desp,
+            return_home=True,
+        )
+        plans = [hover_plan, lower_and_release_plan, lift_plan]
+        if include_pick_plan:
+            return [pick_plan] + plans
+        return plans
 
 
     def adjust_inhand_names(
