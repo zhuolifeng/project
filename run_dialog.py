@@ -57,7 +57,7 @@ class LLMRunner:
         use_history: bool = False,
         use_feedback: bool = False,
         temperature: float = 0.0,
-        llm_source: str = "gpt4",
+        llm_source: str = "qwen3.5:27b",
         run_timeout: float = 600,  # Default 10 minutes timeout
         ):
         self.env = env
@@ -522,7 +522,7 @@ if __name__ == "__main__":
     parser.add_argument("--split_parsed_plans", "-sp", action="store_true")
     parser.add_argument("--no_history", "-nh", action="store_true")
     parser.add_argument("--no_feedback", "-nf", action="store_true")
-    parser.add_argument("--llm_source", "-llm", type=str, default="qwen3:32b") # You can choose one model here.
+    parser.add_argument("--llm_source", "-llm", type=str, default="qwen3.5:27b") # You can choose one model here.
     parser.add_argument("--seed", "-seed", type=int, default=0)
     parser.add_argument("--run_timeout", "-rt", type=float, default=600, help="Timeout for each run in seconds (default: 600s = 10min)")
     logging.basicConfig(level=logging.INFO)

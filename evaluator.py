@@ -17,7 +17,7 @@ DEFAULT_RUN_TIMEOUTS = {
     "pack": 600,
 }
 
-def test_run_dialog(task: str, num_runs: int, output_dir: str, seed: int = 0, run_timeout: float = None):
+def test_run_dialog(task: str, num_runs: int, output_dir: str, seed: int = 1458785, run_timeout: float = None):
     """
     Test and run dialog tasks
     
