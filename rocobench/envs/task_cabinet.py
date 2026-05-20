@@ -158,22 +158,6 @@ class CabinetTask(MujocoSimEnv):
     def use_preplace(self):
         return True
 
-    @property
-    def use_pick_place_preplace(self):
-        return True
-
-    @property
-    def pick_place_preplace_height(self):
-        return 0.16
-
-    @property
-    def slow_release_policy_kwargs(self):
-        return dict(
-            release_control_freq=1,
-            post_release_hold_steps=30,
-            slow_release_objects=("cup",),
-        )
-
     def get_allowed_collision_pairs(self) -> List[Tuple[int, int]]:
         ret = []
         cabinet_ids = self.get_all_body_ids('cabinet') 

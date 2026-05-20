@@ -520,59 +520,26 @@ class LLMResponseParser:
         # update the target quat!
         place_target_pose[3:] = pick_target_pose[3:]
 
-        use_pick_place_preplace = bool(
-            getattr(self.env, "use_pick_place_preplace", False)
+        place_waypoints = self.add_direct_waypoints(
+            ee_start=pick_target_pose,
+            ee_target=place_target_pose,
         )
-        preplace_height = float(
-            getattr(self.env, "pick_place_preplace_height", 0.1)
-        )
-
-        if use_pick_place_preplace:
-            preplace_target_pose = place_target_pose.copy()
-            preplace_target_pose[2] += preplace_height
-            place_waypoints = self.add_direct_waypoints(
-                ee_start=pick_target_pose,
-                ee_target=preplace_target_pose,
-            )
-        else:
-            preplace_target_pose = place_target_pose
-            place_waypoints = self.add_direct_waypoints(
-                ee_start=pick_target_pose,
-                ee_target=place_target_pose,
-            )
         tograsp = pick_plan[0]['tograsp']
         obj_name, obj_site = tograsp[0], tograsp[1]
         
         place_plan = dict(
             robot_name=agent_name,
-            ee_targets=preplace_target_pose,
+            ee_targets=place_target_pose,
             ee_waypoints=place_waypoints,
-            tograsp=(None if use_pick_place_preplace else (obj_name, obj_site, 0)),
+            tograsp=(obj_name, obj_site, 0),
             inhand=None, # NOTE: tmp issue here, cannot set inhand to (obj_name, obj_site, joint_name) when planning ahead
             action_strs=action_desp,
-            return_home=(not use_pick_place_preplace)
+            return_home=True
         )
 
         current_pose = np.array(robot_state.ee_pose)
  
-        if not use_pick_place_preplace:
-            return True, "parse success", [pick_plan[0], place_plan] #, move_plan]
-
-        final_place_waypoints = self.add_direct_waypoints(
-            ee_start=preplace_target_pose,
-            ee_target=place_target_pose,
-        )
-        final_place_plan = dict(
-            robot_name=agent_name,
-            ee_targets=place_target_pose,
-            ee_waypoints=final_place_waypoints,
-            tograsp=(obj_name, obj_site, 0),
-            inhand=None,
-            action_strs=action_desp,
-            return_home=True,
-        )
-
-        return True, "parse success", [pick_plan[0], place_plan, final_place_plan]
+        return True, "parse success", [pick_plan[0], place_plan] #, move_plan]
 
 
     def adjust_inhand_names(
