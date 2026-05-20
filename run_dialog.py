@@ -1,4 +1,5 @@
 import os
+os.environ.setdefault("OLLAMA_THINK", "false")
 import pickle
 import json
 import numpy as np
