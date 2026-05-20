@@ -35,6 +35,9 @@ class PlannedPathPolicy:
         allowed_collision_pairs: Optional[List[Tuple[int, int]]] = None,
         plan_splitted: bool = False,
         timeout: int = 200,
+        release_control_freq: Optional[int] = None,
+        post_release_hold_steps: int = 0,
+        slow_release_objects: Tuple[str, ...] = (),
     ):
         self.robot_names = robots.keys()
         self.robots = robots
@@ -51,6 +54,9 @@ class PlannedPathPolicy:
         self.rrt_plan_results = None
         self.path_plan = path_plan 
         self.control_freq = control_freq
+        self.release_control_freq = release_control_freq
+        self.post_release_hold_steps = post_release_hold_steps
+        self.slow_release_objects = tuple(slow_release_objects)
         
         self.close_loop = close_loop # need to re-plan if close_loop is True
         self.check_relative_pose = check_relative_pose
@@ -63,13 +69,21 @@ class PlannedPathPolicy:
         self.allowed_collision_pairs = allowed_collision_pairs
         self.parse_llm_plan_to_qpos(
             physics, path_plan, update=True
-            )
+        )
         self.action_buffer = []
         self.action_idx = 0
         self.skip_direct_path = skip_direct_path # enforces the planner to go through the valid waypoints 
         self.skip_smooth_path = skip_smooth_path # skip smoothing the path, useful for debugging
         self.plan_splitted = plan_splitted # if True, the plan is splitted into two parts, one for each robot
         self.timeout = timeout # timeout for each planning step, in number of planning steps
+
+    def _is_slow_release_plan(self) -> bool:
+        for obj_info in self.tograsp.values():
+            if obj_info is None:
+                continue
+            if obj_info["grasp_val"] == 0 and obj_info["obj_name"] in self.slow_release_objects:
+                return True
+        return False
 
 
     def ik_ee_poses_to_qpos(self, physics, ee_poses: Dict[str, Pose]) -> Dict[str, np.ndarray]:
@@ -258,7 +272,10 @@ class PlannedPathPolicy:
             # breakpoint()
             return None, path[1]
         path_ls = list(path[0])
-        path_ls = path_ls[::self.control_freq] + path_ls[-3:-1]
+        control_freq = self.control_freq
+        if self._is_slow_release_plan() and self.release_control_freq is not None:
+            control_freq = max(1, int(self.release_control_freq))
+        path_ls = path_ls[::control_freq] + path_ls[-3:-1]
         return path_ls, path[1]
     
     def map_qpos_to_ctrl(self, physics, qpos: np.ndarray, include_inhand: bool = True) -> Dict[str, np.ndarray]:
@@ -433,6 +450,8 @@ class PlannedPathPolicy:
         end_qpos = path_ls[-1] 
         grasp_actions = self.get_grasp_action(physics, end_qpos)
         actions.extend(grasp_actions) 
+        if self._is_slow_release_plan() and grasp_actions:
+            actions.extend([grasp_actions[-1]] * int(self.post_release_hold_steps))
         actions.extend(
             self.plan_home(physics, end_qpos)
         )  
@@ -457,5 +476,4 @@ class PlannedPathPolicy:
             assert len(self.action_buffer) != 0, "action buffer is empty, cal plan_qpos first"
         action = self.action_buffer[self.action_idx]
         self.action_idx += 1
-        return action 
- 
+        return action

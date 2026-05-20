@@ -520,12 +520,23 @@ class LLMResponseParser:
         # update the target quat!
         place_target_pose[3:] = pick_target_pose[3:]
 
+        tograsp = pick_plan[0]['tograsp']
+        obj_name, obj_site = tograsp[0], tograsp[1]
+        if self._use_stable_place(obj_name, place_target_name):
+            return True, "parse success", self._build_stable_place_plans(
+                agent_name=agent_name,
+                action_desp=action_desp,
+                pick_plan=pick_plan[0],
+                pick_target_pose=pick_target_pose,
+                place_target_pose=place_target_pose,
+                obj_name=obj_name,
+                obj_site=obj_site,
+            )
+
         place_waypoints = self.add_direct_waypoints(
             ee_start=pick_target_pose,
             ee_target=place_target_pose,
         )
-        tograsp = pick_plan[0]['tograsp']
-        obj_name, obj_site = tograsp[0], tograsp[1]
         
         place_plan = dict(
             robot_name=agent_name,
@@ -540,6 +551,66 @@ class LLMResponseParser:
         current_pose = np.array(robot_state.ee_pose)
  
         return True, "parse success", [pick_plan[0], place_plan] #, move_plan]
+
+    def _use_stable_place(self, obj_name: str, target_name: str) -> bool:
+        stable_objects = getattr(self.env, "stable_place_objects", ())
+        return obj_name in stable_objects and target_name == f"{obj_name}_coaster"
+
+    def _build_stable_place_plans(
+        self,
+        agent_name: str,
+        action_desp: str,
+        pick_plan: Dict,
+        pick_target_pose: np.ndarray,
+        place_target_pose: np.ndarray,
+        obj_name: str,
+        obj_site: str,
+    ) -> List[Dict]:
+        hover_height = float(getattr(self.env, "stable_place_hover_height", 0.18))
+        lift_height = float(getattr(self.env, "stable_place_lift_height", 0.14))
+
+        hover_pose = place_target_pose.copy()
+        hover_pose[2] += hover_height
+        lift_pose = place_target_pose.copy()
+        lift_pose[2] += lift_height
+
+        hover_plan = dict(
+            robot_name=agent_name,
+            ee_targets=hover_pose,
+            ee_waypoints=self.add_direct_waypoints(
+                ee_start=pick_target_pose,
+                ee_target=hover_pose,
+            ),
+            tograsp=None,
+            inhand=None,
+            action_strs=action_desp,
+            return_home=False,
+        )
+        lower_and_release_plan = dict(
+            robot_name=agent_name,
+            ee_targets=place_target_pose,
+            ee_waypoints=self.add_direct_waypoints(
+                ee_start=hover_pose,
+                ee_target=place_target_pose,
+            ),
+            tograsp=(obj_name, obj_site, 0),
+            inhand=None,
+            action_strs=action_desp,
+            return_home=False,
+        )
+        lift_plan = dict(
+            robot_name=agent_name,
+            ee_targets=lift_pose,
+            ee_waypoints=self.add_direct_waypoints(
+                ee_start=place_target_pose,
+                ee_target=lift_pose,
+            ),
+            tograsp=None,
+            inhand=None,
+            action_strs=action_desp,
+            return_home=True,
+        )
+        return [pick_plan, hover_plan, lower_and_release_plan, lift_plan]
 
 
     def adjust_inhand_names(

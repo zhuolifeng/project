@@ -53,6 +53,7 @@ Each robot does **exactly** one ACTION per round, selected from only one of the 
 Planning checklist for this task:
 - Phase 1: PICK/OPEN both door handles; after a door is open, that robot should WAIT to hold it open.
 - Phase 2: only when both doors are open and held open, PICK mug PLACE mug_coaster and PICK cup PLACE cup_coaster.
+- Cup placement is executed with a stable lowering routine: hover above cup_coaster, descend gently, release, pause briefly, then lift away.
 - Respect each agent prompt's reachable objects. If feedback says an object or handle is unreachable, do not repeat the same failed action.
 - If an object manipulation fails, change the assigned robot or wait with the blocked robot while another valid door/object action progresses.
 - Do not output all WAIT unless both mug and cup are already on their correct coasters.
@@ -153,6 +154,26 @@ class CabinetTask(MujocoSimEnv):
             right_door_handle=self.compute_open_pose("right_door_handle"),
         )
         self.cabinet_pos = self.physics.data.body("cabinet").xpos.copy()
+
+    @property
+    def stable_place_objects(self):
+        return ("cup",)
+
+    @property
+    def stable_place_hover_height(self):
+        return 0.18
+
+    @property
+    def stable_place_lift_height(self):
+        return 0.14
+
+    @property
+    def slow_release_policy_kwargs(self):
+        return dict(
+            release_control_freq=1,
+            post_release_hold_steps=20,
+            slow_release_objects=self.stable_place_objects,
+        )
 
     def get_allowed_collision_pairs(self) -> List[Tuple[int, int]]:
         ret = []
