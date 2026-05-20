@@ -304,6 +304,7 @@ class LLMRunner:
             if rewind_env:
                 print("Rewinding the environment to before the first plan was executed.")
                 env.load_saved_state(sim_data)
+                obs = env.get_obs()
 
             else:
                 sim_data = env.save_intermediate_state()

@@ -3,6 +3,7 @@ import copy
 import time
 import cv2 
 import random
+import re
 import numpy as np  
 from pydantic import dataclasses, validator 
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
@@ -56,6 +57,9 @@ Planning checklist for this task:
 - Cup placement is executed with a stable lowering routine: hover above cup_coaster, descend gently, release, pause briefly, then lift away.
 - Respect each agent prompt's reachable objects. If feedback says an object or handle is unreachable, do not repeat the same failed action.
 - If an object manipulation fails, change the assigned robot or wait with the blocked robot while another valid door/object action progresses.
+- Recovery priority: if mug or cup is outside cabinet and not on its coaster, recover that abnormal object first.
+- If cup is in an abnormal state with y >= 1.0 or z <= 0.0, do not assign Chad to PICK cup PLACE cup_coaster.
+- If a robot is already holding mug or cup, do not assign that robot another PICK; continue with placing the object it already holds.
 - Do not output all WAIT unless both mug and cup are already on their correct coasters.
 """
 CABINET_TASK_CHAT_PROMPT="""Robots discuss to find the best strategy. When each robot talk, it must first reflects on the task status, and its own capability. 
@@ -407,6 +411,128 @@ class CabinetTask(MujocoSimEnv):
         robot_desp = "\n".join([self.describe_robot_state(obs, name) for name in self.robot_name_map_inv.keys()])
         full_desp = object_desp + robot_desp
         return full_desp 
+
+    def _extract_actions(self, response: str) -> Dict[str, str]:
+        actions = {}
+        for line in (response or "").splitlines():
+            if "NAME" not in line or "ACTION" not in line:
+                continue
+            try:
+                agent_name = line.split("NAME", 1)[1].split("ACTION", 1)[0].strip()
+                action = line.split("ACTION", 1)[1].strip().strip(" '\"`")
+            except IndexError:
+                continue
+            if agent_name in ["Alice", "Bob", "Chad"]:
+                actions[agent_name] = action
+        return actions
+
+    def _format_actions(self, actions: Dict[str, str]) -> str:
+        return "\n".join(
+            ["EXECUTE"]
+            + [f"NAME {agent_name} ACTION {actions.get(agent_name, 'WAIT')}" for agent_name in ["Alice", "Bob", "Chad"]]
+        )
+
+    def _held_object(self, obs: EnvState, agent_name: str) -> Optional[str]:
+        robot_name = self.robot_name_map_inv[agent_name]
+        robot_state = getattr(obs, robot_name)
+        contacts = set(getattr(robot_state, "contacts", []) or [])
+        for obj in ["cup", "mug"]:
+            if obj in contacts:
+                return obj
+        return None
+
+    def _object_status(self, obs: EnvState, obj_name: str) -> Tuple[str, Optional[np.ndarray]]:
+        obj_pos = np.array(self.physics.data.body(obj_name).xpos.copy())
+        coaster_pos = self.coaster_pos[f"{obj_name}_coaster"]
+        if np.linalg.norm(obj_pos - coaster_pos) < self.align_threshold:
+            return "coaster", obj_pos
+        if np.linalg.norm(obj_pos - self.cabinet_pos) < 0.35:
+            return "cabinet", obj_pos
+        return "outside", obj_pos
+
+    def _doors_open(self) -> bool:
+        left_qpos_slice = self.physics.named.data.qpos._convert_key("leftdoorhinge")
+        right_qpos_slice = self.physics.named.data.qpos._convert_key("rightdoorhinge")
+        left_open = self.physics.data.qpos[left_qpos_slice.start] <= -2
+        right_open = self.physics.data.qpos[right_qpos_slice.start] >= 2
+        return bool(left_open and right_open)
+
+    def correct_action_response(
+        self,
+        obs: EnvState,
+        response: str,
+        previous_actions: Optional[Dict[str, str]] = None,
+    ) -> Tuple[str, str]:
+        actions = self._extract_actions(response)
+        if len(actions) == 0:
+            return response, ""
+
+        held = {agent_name: self._held_object(obs, agent_name) for agent_name in ["Alice", "Bob", "Chad"]}
+        cleaned_actions = dict(actions)
+
+        for agent_name, held_obj in held.items():
+            action = cleaned_actions.get(agent_name)
+            if held_obj is None or action is None:
+                continue
+            if action.upper().startswith("PICK ") and f"PICK {held_obj} PLACE {held_obj}_coaster".upper() != action.upper():
+                cleaned_actions[agent_name] = f"PICK {held_obj} PLACE {held_obj}_coaster"
+                return self._format_actions(cleaned_actions), (
+                    f"{agent_name} is already holding {held_obj}; forcing continuation to place the held object."
+                )
+
+        cup_state, cup_pos = self._object_status(obs, "cup")
+        mug_state, mug_pos = self._object_status(obs, "mug")
+        abnormal_cup = (
+            cup_state == "outside"
+            and cup_pos is not None
+            and (cup_pos[1] >= 1.0 or cup_pos[2] <= 0.0)
+        )
+        if abnormal_cup:
+            chad_action = cleaned_actions.get("Chad", "")
+            if re.match(r"^PICK\s+cup\s+PLACE\s+cup_coaster$", chad_action, flags=re.IGNORECASE):
+                cleaned_actions["Chad"] = "WAIT"
+                if held.get("Alice") == "cup":
+                    cleaned_actions["Alice"] = "PICK cup PLACE cup_coaster"
+                return self._format_actions(cleaned_actions), (
+                    "Blocked Chad from recovering abnormal cup state (cup.y >= 1.0 or cup.z <= 0.0)."
+                )
+
+        recovery_target = None
+        if mug_state == "outside":
+            recovery_target = "mug"
+        elif cup_state == "outside":
+            recovery_target = "cup"
+
+        if recovery_target is not None:
+            desired = f"PICK {recovery_target} PLACE {recovery_target}_coaster"
+            assigned = any(
+                action.upper() == desired.upper()
+                for action in cleaned_actions.values()
+            )
+            if not assigned:
+                for agent_name in ["Alice", "Bob", "Chad"]:
+                    if held.get(agent_name) == recovery_target:
+                        cleaned_actions[agent_name] = desired
+                        return self._format_actions(cleaned_actions), (
+                            f"Recovery priority: {recovery_target} is outside cabinet; forcing placement of the displaced object."
+                        )
+
+        if self._doors_open():
+            for agent_name in ["Alice", "Bob"]:
+                robot_name = self.robot_name_map_inv[agent_name]
+                contacts = set(getattr(obs, robot_name).contacts or [])
+                if any(handle in contacts for handle in ["left_door_handle", "right_door_handle", "cabinet_body"]):
+                    action = cleaned_actions.get(agent_name, "")
+                    if action and action.upper() != "WAIT":
+                        cleaned_actions[agent_name] = "WAIT"
+                        return self._format_actions(cleaned_actions), (
+                            f"{agent_name} should WAIT to hold the opened cabinet door."
+                        )
+
+        cleaned = self._format_actions(cleaned_actions)
+        if cleaned != response and len(cleaned_actions) == 3:
+            return cleaned, "Cleaned cabinet action output format."
+        return response, ""
     
     def get_agent_prompt(self, obs: EnvState, agent_name: str):
         other_robots = [name for name in self.robots.keys() if name != agent_name]
@@ -470,20 +596,47 @@ End your response by either: 1) output PROCEED, if the plans require further dis
         return reward, done
                 
     def get_task_feedback(self, llm_plan, pose_dict):
-        feedback = ""
+        feedbacks = []
+        obs = self.get_obs()
+        held = {agent_name: self._held_object(obs, agent_name) for agent_name in ["Alice", "Bob", "Chad"]}
+        cup_state, cup_pos = self._object_status(obs, "cup")
+        mug_state, mug_pos = self._object_status(obs, "mug")
         for agent_name, action_str in llm_plan.action_strs.items():
             if 'PICK mug' in action_str or 'PICK cup' in action_str:
                 if 'PLACE' not in action_str:
-                    feedback += f"{agent_name}'s ACTION must contain both PICK and PLACE"
+                    feedbacks.append(f"{agent_name}'s ACTION must contain both PICK and PLACE")
             if self.cabinet_pos[0] < 0:
                 if 'door_handle' in action_str and agent_name == "Chad":
-                    feedback += f"{agent_name} cannot reach door"
+                    feedbacks.append(f"{agent_name} cannot reach door")
             else:
                 if 'door_handle' in action_str and agent_name == "Bob":
-                    feedback += f"{agent_name} cannot reach door"
+                    feedbacks.append(f"{agent_name} cannot reach door")
+            if held[agent_name] is not None:
+                held_obj = held[agent_name]
+                expected = f"PICK {held_obj} PLACE {held_obj}_coaster"
+                if 'PICK' in action_str and action_str.strip() != expected:
+                    feedbacks.append(
+                        f"{agent_name} is already holding {held_obj}; continue placing {held_obj} instead of picking another object."
+                    )
+            if agent_name == "Chad" and re.match(r"^PICK\s+cup\s+PLACE\s+cup_coaster$", action_str, flags=re.IGNORECASE):
+                if cup_state == "outside" and cup_pos is not None and (cup_pos[1] >= 1.0 or cup_pos[2] <= 0.0):
+                    feedbacks.append("Chad must not recover cup when cup.y >= 1.0 or cup.z <= 0.0.")
         if all(['WAIT' in action_str for action_str in llm_plan.action_strs.values()]):
-            feedback += "At least one robot should be acting, you can't all WAIT."
-        return feedback 
+            if mug_state != "coaster" or cup_state != "coaster":
+                feedbacks.append("At least one robot should be acting, you can't all WAIT.")
+
+        displaced = []
+        if mug_state == "outside":
+            displaced.append("mug")
+        if cup_state == "outside":
+            displaced.append("cup")
+        if displaced:
+            for obj_name in displaced:
+                desired = f"PICK {obj_name} PLACE {obj_name}_coaster"
+                if not any(action.strip() == desired for action in llm_plan.action_strs.values()):
+                    feedbacks.append(f"Recovery priority violated: {obj_name} is outside cabinet and must be recovered first.")
+
+        return " ".join(feedbacks)
 
     def describe_robot_capability(self):
         return ""
